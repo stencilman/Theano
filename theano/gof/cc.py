@@ -1354,8 +1354,12 @@ class CLinker(link.Linker):
                     lib_dirs=self.lib_dirs(),
                     libs=libs,
                     preargs=preargs)[2]))
+        if c_callable:
+            # Add the include filename with the placeholder, as the hash is not
+            # yet computer, but we need to add the include to compute the hash.
+            filename_h = os.path.join(location, mod.hash_placeholder + '.h')
+            mod.add_include(filename_h)
         src_code = mod.code()
-        get_lock()
         try:
             _logger.debug("LOCATION %s", str(location))
 
@@ -1370,8 +1374,6 @@ class CLinker(link.Linker):
                     preargs=preargs)
 
                 if c_callable:
-                    filename = os.path.join(location, '%s.h' % mod.code_hash)
-                    mod.gen_header(filename)
                     # The main of the executable need the hash of the
                     # shared lib.
                     main = re.sub(mod.hash_placeholder, mod.code_hash,
@@ -1380,7 +1382,7 @@ class CLinker(link.Linker):
                     mod_exec = cmodule.DynamicModule()
                     for header in self.headers():
                         mod_exec.add_include(header)
-                    mod_exec.add_include(filename)
+                    mod_exec.add_include(filename_h)
                     mod_exec.add_support_code(main)
                     # create an executable.
                     mod_exec.add_header_code(
