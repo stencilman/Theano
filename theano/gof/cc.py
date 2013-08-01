@@ -200,6 +200,11 @@ def struct_gen(args, struct_builders, blocks, sub):
     a function with state. The state's initialization and destruction
     are handled by struct_builders and the actual behavior of the
     function is handled by blocks.
+
+    The run() method of the struct is defined separatly. This allow to
+    have the struct definition in one file and to compile the
+    execution of the struct in a dynamic library.
+
     """
 
     struct_decl = ""
@@ -293,21 +298,24 @@ def struct_gen(args, struct_builders, blocks, sub):
             %(struct_init_head)s
             this->__ERROR = __ERROR;
             return 0;
-        }
+        }// end init()
         void cleanup(void) {
             %(struct_cleanup)s
             %(storage_decref)s
-        }
-        int run(void) {
+        } // end cleanup()
+        int run(void);
+    };
+    """ % sub
+    run_code = """
+        int %(name)s::run(void) {
             int %(failure_var)s = 0;
             %(behavior)s
             %(do_return)s
         }
-    };
     }
     """ % sub
 
-    return struct_code
+    return struct_code, run_code
 
 
 # The get_<x> functions complete the return value of r.get_<x>()
@@ -547,7 +555,7 @@ class CLinker(link.Linker):
     def code_gen(self):
         """WRITEME
         Generates code for a struct that does the computation of the fgraph and
-        stores it in the struct_code field of the instance.
+        stores it in the struct_code and run_code field of the instance.
 
         If reuse_storage is True, outputs and temporaries will be stored in
         the struct so they can be reused each time a function returned by
@@ -559,7 +567,7 @@ class CLinker(link.Linker):
         """
 
         if getattr(self, 'struct_code', False):
-            return self.struct_code
+            return self.struct_code, self.run_code
 
         no_recycling = self.no_recycling
 
@@ -789,11 +797,12 @@ class CLinker(link.Linker):
         # <<<<HASH_PLACEHOLDER>>>> will be replaced by a hash of the whole
         # code in the file, including support code, in DynamicModule.code.
         struct_name = '__struct_compiled_op_%s' % '<<<<HASH_PLACEHOLDER>>>>'
-        struct_code = struct_gen(args, init_blocks, blocks,
+        struct_code, run_code = struct_gen(args, init_blocks, blocks,
                                  dict(failure_var=failure_var,
                                       name=struct_name))
 
         self.struct_code = struct_code
+        self.run_code = run_code
         self.struct_name = struct_name
         self.args = args
         self.r2symbol = symbol
@@ -1698,6 +1707,8 @@ PyErr_Print();
         in_out_param = ', '.join(in_out_param)
         print >> code, """
 %(struct_name)s* cinit() {
+
+    import_array1(NULL);
 
     // Define the list for error information.
     PyObject* err_list = PyList_New(3);
