@@ -1325,7 +1325,6 @@ class CLinker(link.Linker):
                 return ((), sig)
         return version, sig
 
-
     def get_src_code(self):
         mod = self.get_dynamic_module()
         return mod.code()
@@ -1408,7 +1407,6 @@ class CLinker(link.Linker):
                     # Make the executable link to the shared lib.
                     preargs.append(os.path.join(location, mod.code_hash + "." +
                                                 cmodule.get_lib_extension()))
-
                     # Put the command line in the header code so that
                     # other people know how to recompile the executable
                     mod_exec.add_header_code(

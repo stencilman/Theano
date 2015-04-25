@@ -2093,7 +2093,7 @@ class GCC_compiler(Compiler):
             shared,
             code_filename,
             out_filename)
-        cppfilename = os.path.join(location, 'mod.cpp')
+
         cppfile = open(cpp_filename, 'w')
 
         _logger.debug('Writing module C++ code to %s', cpp_filename)
@@ -2105,7 +2105,6 @@ class GCC_compiler(Compiler):
         cppfile.close()
 
         _logger.debug('Running cmd: %s', cmd)
-
 
         def print_command_line_error():
             # Print command line when a problem occurred.
