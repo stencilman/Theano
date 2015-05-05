@@ -187,7 +187,7 @@ static struct PyModuleDef moduledef = {{
         print("}", file=stream)
 
     def add_include(self, str):
-        assert not self.finalized
+        # assert not self.finalized
         self.includes.append(str)
 
     def add_init_code(self, code):
@@ -624,6 +624,7 @@ class ModuleCache(object):
         :param do_refresh: If True, then the ``refresh`` method will be called
         in the constructor.
         """
+
         self.dirname = dirname
         self.module_from_name = dict(self.module_from_name)
         self.entry_from_key = dict(self.entry_from_key)

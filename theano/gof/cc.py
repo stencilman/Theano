@@ -1073,7 +1073,7 @@ class CLinker(link.Linker):
           first_output = ostor[0].data
         """
         init_tasks, tasks = self.get_init_tasks()
-  
+
         cthunk, in_storage, out_storage, error_storage, filename = self.__compile__(
             input_storage, output_storage,
             keep_lock=keep_lock)
@@ -1163,11 +1163,11 @@ class CLinker(link.Linker):
                                  libraries=self.libraries(),
                                  header_dirs=self.header_dirs(),
                                  c_compiler=self.c_compiler(),
-                             )
+                                 c_callable=self.c_callable)
 
     def cmodule_key_(self, fgraph, no_recycling, compile_args=None,
                      libraries=None, header_dirs=None, insert_config_md5=True,
-                     c_compiler=None):
+                     c_compiler=None, c_callable=None):
         """
         Do the actual computation of cmodule_key in a static method
         to allow it to be reused in scalar.Composite.__eq__
@@ -1227,7 +1227,7 @@ class CLinker(link.Linker):
 
         # We append it only if we are c_callable to don't trash the
         # old compiled dir.
-        if self.c_callable:
+        if c_callable:
             sig.append('c_callable: ' + str(self.c_callable))
 
         error_on_play = [False]
@@ -1341,6 +1341,7 @@ class CLinker(link.Linker):
         libs = self.libraries()
         preargs = self.compile_args()
         compiler_name = c_compiler.__name__
+
         if compiler_name == 'NVCC_compiler' and config.lib.amdlibm:
             # This lib does not work correctly with nvcc in device code.
             # and newer version of g++ as 4.5.1.
@@ -1354,6 +1355,7 @@ class CLinker(link.Linker):
                 preargs.remove('-DREPLACE_WITH_AMDLIBM')
             if 'amdlibm' in libs:
                 libs.remove('amdlibm')
+
         if self.c_callable:
             # Add the include filename with the placeholder, as the hash is not
             # yet computer, but we need to add the include to compute the hash.
@@ -1558,8 +1560,8 @@ class CLinker(link.Linker):
             key = self.cmodule_key()
         except KeyError:
             key = None
-        # TODO: enable the cache when c_callable is True.
-        if key is None or self.c_callable:
+
+        if key is None:  # or self.c_callable is True:
             # If we can't get a key, then forget the cache mechanism.
             module = self.compile_cmodule()
         else:
