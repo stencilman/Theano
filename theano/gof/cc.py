@@ -169,7 +169,6 @@ def code_gen(blocks):
          cleanup1
         }
     """
-
     decl = ""
     head = ""
     tail = ""
@@ -557,7 +556,6 @@ class CLinker(link.Linker):
 
         This method caches its computations.
         """
-
         if getattr(self, 'struct_code', False):
             return self.struct_code, self.run_code
 
@@ -1072,6 +1070,7 @@ class CLinker(link.Linker):
           f()
           first_output = ostor[0].data
         """
+
         init_tasks, tasks = self.get_init_tasks()
 
         cthunk, in_storage, out_storage, error_storage, filename = self.__compile__(
@@ -1475,7 +1474,7 @@ class CLinker(link.Linker):
             self.code_gen()
 
             mod = cmodule.DynamicModule()
-            
+
             # The code of instantiate
             # the 1 is for error_storage
             code = self.instantiate_code(1 + len(self.args))
@@ -1535,7 +1534,7 @@ class CLinker(link.Linker):
                 mod.add_include(header)
             for init_code_block in self.init_code() + self.c_init_code_apply:
                 if self.c_callable:
-                    mod.add_support_code(self.cinit_code(len(self.args)))
+                    mod.add_support_code(self.cinit_code())
                     mod.add_header_code("""
                                         DllExport %(struct_name)s* cinit();
                                         """ % dict(struct_name=self.struct_name))
@@ -1718,20 +1717,32 @@ PyErr_Print();
                    **locals())
         return main
 
-    def cinit_code(self, n_args):
+    def cinit_code(self):
         code = StringIO()
+        n_args = len(self.args)
         struct_name = self.struct_name
-        param = ','.join('PyObject * arg_%i' % n for n in xrange(n_args)), ');'
-
+        param = ','.join('PyObject * arg_%i' % n for n in range(n_args)), ');'
+        symbol2r = {v: k for k, v in self.r2symbol.items()}
         in_out_list = ""
         in_out_param = ["io%d_list" % idx for idx in range(n_args)]
-        for idx in range(n_args):
+        for idx, arg in enumerate(self.args):
             var = in_out_param[idx]
-            in_out_list += """
+            argType = symbol2r[arg.replace("storage_", "")]
+            if isinstance(argType, graph.Constant):
+                in_out_list += """
+                PyObject* %(var)s = PyList_New(1);
+                npy_intp dims[1]={1};
+                PyObject* const_%(var)s = PyArray_SimpleNew(1,dims,NPY_FLOAT64);
+                Py_XINCREF(const_%(var)s);
+                ((double *)(PyArray_DATA((PyArrayObject *)const_%(var)s)))[0]=0;
+                PyList_SetItem(%(var)s, 0,const_%(var)s);
+                """ % locals()
+            else:
+                in_out_list += """
                 PyObject* %(var)s = PyList_New(1);
                 Py_INCREF(Py_None);
                 PyList_SetItem(%(var)s, 0, Py_None);
-            """ % locals()
+                """ % locals()
         in_out_param = ', '.join(in_out_param)
         print >> code, """
 %(struct_name)s* cinit() {
