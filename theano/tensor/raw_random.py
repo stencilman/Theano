@@ -8,9 +8,11 @@ import numpy
 
 # local imports
 import theano
+from six.moves import reduce, xrange
 from theano import tensor
 from theano.tensor import opt
 from theano import gof
+from six import string_types
 from theano.compile import optdb
 
 
@@ -143,7 +145,7 @@ class RandomFunction(gof.Op):
     def __setstate__(self, state):
         self.state = state
         fn, outtype, inplace, ndim_added = state
-        if isinstance(fn, basestring):
+        if isinstance(fn, string_types):
             self.fn = getattr(numpy.random.RandomState, fn)
         else:
             self.fn = fn
@@ -201,7 +203,7 @@ class RandomFunction(gof.Op):
 
         # convert args to TensorType instances
         # and append enough None's to match the length of self.args
-        args = map(tensor.as_tensor_variable, args)
+        args = list(map(tensor.as_tensor_variable, args))
 
         return gof.Apply(self,
                          [r, shape] + args,
@@ -416,7 +418,7 @@ def _generate_broadcasting_indices(out_shape, *shapes):
         # Temporary list to generate the indices
         _ret_indices = [[] for shape in all_shapes]
 
-        out_range = range(out_shape[dim])
+        out_range = list(range(out_shape[dim]))
 
         # Verify the shapes are compatible along that dimension
         # and generate the appropriate range: out_range, or [0, ..., 0]
@@ -866,8 +868,11 @@ def multinomial(random_state, size=None, n=1, pvals=[0.5, 0.5],
 def random_make_inplace(node):
     op = node.op
     if isinstance(op, RandomFunction) and not op.inplace:
-        new_op = RandomFunction(op.fn, op.outtype, inplace=True,
-                                ndim_added=op.ndim_added)
+        # Read op_fn from op.state, not from op.fn, since op.fn
+        # may not be picklable.
+        op_fn, op_outtype, op_inplace, op_ndim_added = op.__getstate__()
+        new_op = RandomFunction(op_fn, op_outtype, inplace=True,
+                                ndim_added=op_ndim_added)
         return new_op.make_node(*node.inputs).outputs
     return False
 

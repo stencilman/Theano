@@ -2,7 +2,7 @@
 """
 from __future__ import print_function
 import atexit
-import cPickle
+import six.moves.cPickle as pickle
 import logging
 import os
 import re
@@ -25,7 +25,7 @@ import numpy.distutils  # TODO: TensorType should handle this
 
 import theano
 from theano.compat import PY3, decode, decode_iter
-from theano.compat.six import b, BytesIO, StringIO
+from six import b, BytesIO, StringIO, string_types, iteritems
 from theano.gof.utils import flatten
 from theano.configparser import config
 from theano.gof.cc import hash_from_code
@@ -397,7 +397,7 @@ def get_module_hash(src_code, key):
     to_hash = [l.strip() for l in src_code.split('\n')]
     # Get the version part of the key (ignore if unversioned).
     if key[0]:
-        to_hash += map(str, key[0])
+        to_hash += list(map(str, key[0]))
     c_link_key = key[1]
     # Currently, in order to catch potential bugs early, we are very
     # convervative about the structure of the key and raise an exception
@@ -417,7 +417,7 @@ def get_module_hash(src_code, key):
             # This should be the C++ compilation command line parameters or the
             # libraries to link against.
             to_hash += list(key_element)
-        elif isinstance(key_element, basestring):
+        elif isinstance(key_element, string_types):
             if key_element.startswith('md5:'):
                 # This is the md5 hash of the config options. We can stop
                 # here.
@@ -450,7 +450,7 @@ def get_safe_part(key):
     # Find the md5 hash part.
     c_link_key = key[1]
     for key_element in c_link_key[1:]:
-        if (isinstance(key_element, basestring)
+        if (isinstance(key_element, string_types)
                 and key_element.startswith('md5:')):
             md5 = key_element[4:]
             break
@@ -502,8 +502,8 @@ class KeyData(object):
         # Note that writing in binary mode is important under Windows.
         try:
             with open(self.key_pkl, 'wb') as f:
-                cPickle.dump(self, f, protocol=cPickle.HIGHEST_PROTOCOL)
-        except cPickle.PicklingError:
+                pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except pickle.PicklingError:
             _logger.warning("Cache leak due to unpickle-able key data %s",
                             self.keys)
             os.remove(self.key_pkl)
@@ -531,7 +531,7 @@ class KeyData(object):
             del entry_from_key[key]
         if do_manual_check:
             to_del = []
-            for key, key_entry in entry_from_key.iteritems():
+            for key, key_entry in iteritems(entry_from_key):
                 if key_entry == entry:
                     to_del.append(key)
             for key in to_del:
@@ -743,7 +743,7 @@ class ModuleCache(object):
 
                     try:
                         with open(key_pkl, 'rb') as f:
-                            key_data = cPickle.load(f)
+                            key_data = pickle.load(f)
                     except EOFError:
                         # Happened once... not sure why (would be worth
                         # investigating if it ever happens again).
@@ -891,7 +891,7 @@ class ModuleCache(object):
         del root, files, subdirs
 
         # Remove entries that are not in the filesystem.
-        items_copy = list(self.module_hash_to_key_data.iteritems())
+        items_copy = list(self.module_hash_to_key_data.items())
         for module_hash, key_data in items_copy:
             entry = key_data.get_entry()
             try:
@@ -979,7 +979,7 @@ class ModuleCache(object):
                 try:
                     key_data.add_key(key, save_pkl=bool(key[0]))
                     key_broken = False
-                except cPickle.PicklingError:
+                except pickle.PicklingError:
                     key_data.remove_key(key)
                     key_broken = True
                 # We need the lock while we check in case of parallel
@@ -1033,7 +1033,7 @@ class ModuleCache(object):
         if key[0]:
             try:
                 key_data.save_pkl()
-            except cPickle.PicklingError:
+            except pickle.PicklingError:
                 key_broken = True
                 key_data.remove_key(key)
                 key_data.save_pkl()
@@ -1151,7 +1151,7 @@ class ModuleCache(object):
         for i in range(3):
             try:
                 with open(key_pkl, 'rb') as f:
-                    key_data = cPickle.load(f)
+                    key_data = pickle.load(f)
                 break
             except EOFError:
                 # This file is probably getting written/updated at the
@@ -1160,7 +1160,7 @@ class ModuleCache(object):
                 if i == 2:
                     with compilelock.lock_ctx():
                         with open(key_pkl, 'rb') as f:
-                            key_data = cPickle.load(f)
+                            key_data = pickle.load(f)
                 time.sleep(2)
 
         found = sum(key == other_key for other_key in key_data.keys)
@@ -1313,7 +1313,7 @@ class ModuleCache(object):
             min_age = self.age_thresh_del_unversioned
 
         with compilelock.lock_ctx():
-            all_key_datas = self.module_hash_to_key_data.values()
+            all_key_datas = list(self.module_hash_to_key_data.values())
             for key_data in all_key_datas:
                 if not key_data.keys:
                     # May happen for broken versioned keys.

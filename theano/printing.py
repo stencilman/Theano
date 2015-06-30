@@ -12,6 +12,7 @@ import warnings
 import hashlib
 
 import numpy as np
+from six import string_types, integer_types, iteritems
 
 try:
     import pydot as pd
@@ -25,7 +26,7 @@ except ImportError:
 import theano
 from theano import gof
 from theano import config
-from theano.compat.six import StringIO
+from six.moves import StringIO, reduce
 from theano.gof import Op, Apply
 from theano.compile import Function, debugmode
 from theano.compile.profilemode import ProfileMode
@@ -110,7 +111,7 @@ def debugprint(obj, depth=-1, print_type=False,
             results_to_print.extend(obj.outputs)
             profile_list.extend([None for item in obj.outputs])
             order = obj.toposort()
-        elif isinstance(obj, (int, long, float, np.ndarray)):
+        elif isinstance(obj, (integer_types, float, np.ndarray)):
             print(obj)
         elif isinstance(obj, (theano.In, theano.Out)):
             results_to_print.append(obj.variable)
@@ -149,6 +150,7 @@ N.B.:
                              file=_file, order=order, ids=ids,
                              scan_ops=scan_ops, stop_on_name=stop_on_name,
                              profile=p)
+
     if len(scan_ops) > 0:
         print("", file=_file)
         new_prefix = ' >'
@@ -156,27 +158,47 @@ N.B.:
         print("Inner graphs of the scan ops:", file=_file)
 
         for s in scan_ops:
+            # prepare a dict which maps the scan op's inner inputs
+            # to its outer inputs.
+            if hasattr(s.owner.op, 'fn'):
+                # If the op was compiled, print the optimized version.
+                inner_inputs = s.owner.op.fn.maker.fgraph.inputs
+            else:
+                inner_inputs = s.owner.op.inputs
+            outer_inputs = s.owner.inputs
+            inner_to_outer_inputs = \
+                dict([(inner_inputs[i], outer_inputs[o])
+                      for i, o in
+                      s.owner.op.var_mappings['outer_inp_from_inner_inp']
+                      .items()])
+
             print("", file=_file)
-            debugmode.debugprint(s, depth=depth, done=done,
-                                 print_type=print_type,
-                                 file=_file, ids=ids,
-                                 scan_ops=scan_ops, stop_on_name=stop_on_name)
+            debugmode.debugprint(
+                s, depth=depth, done=done,
+                print_type=print_type,
+                file=_file, ids=ids,
+                scan_ops=scan_ops,
+                stop_on_name=stop_on_name,
+                scan_inner_to_outer_inputs=inner_to_outer_inputs)
             if hasattr(s.owner.op, 'fn'):
                 # If the op was compiled, print the optimized version.
                 outputs = s.owner.op.fn.maker.fgraph.outputs
             else:
                 outputs = s.owner.op.outputs
             for idx, i in enumerate(outputs):
+
                 if hasattr(i, 'owner') and hasattr(i.owner, 'op'):
                     if isinstance(i.owner.op, theano.scan_module.scan_op.Scan):
                         scan_ops.append(i)
 
-                debugmode.debugprint(r=i, prefix=new_prefix,
-                                     depth=depth, done=done,
-                                     print_type=print_type, file=_file,
-                                     ids=ids, stop_on_name=stop_on_name,
-                                     prefix_child=new_prefix_child,
-                                     scan_ops=scan_ops)
+                debugmode.debugprint(
+                    r=i, prefix=new_prefix,
+                    depth=depth, done=done,
+                    print_type=print_type, file=_file,
+                    ids=ids, stop_on_name=stop_on_name,
+                    prefix_child=new_prefix_child,
+                    scan_ops=scan_ops,
+                    scan_inner_to_outer_inputs=inner_to_outer_inputs)
 
     if file is _file:
         return file
@@ -323,7 +345,7 @@ class PatternPrinter:
     def __init__(self, *patterns):
         self.patterns = []
         for pattern in patterns:
-            if isinstance(pattern, basestring):
+            if isinstance(pattern, string_types):
                 self.patterns.append((pattern, ()))
             else:
                 self.patterns.append((pattern[0], pattern[1:]))
@@ -466,7 +488,7 @@ class PPrinter:
             strings = []
         pprinter = self.clone_assign(lambda pstate, r: r.name is not None and
                                      r is not current, LeafPrinter())
-        inv_updates = dict((b, a) for (a, b) in updates.iteritems())
+        inv_updates = dict((b, a) for (a, b) in iteritems(updates))
         i = 1
         for node in gof.graph.io_toposort(list(inputs) + updates.keys(),
                                           list(outputs) +
@@ -821,7 +843,7 @@ def pydotprint(fct, outfile=None,
         astr = apply_name(node)
 
         use_color = None
-        for opName, color in colorCodes.items():
+        for opName, color in iteritems(colorCodes):
             if opName in node.op.__class__.__name__:
                 use_color = color
 
@@ -931,7 +953,16 @@ def pydotprint(fct, outfile=None,
     if return_image:
         return g.create(prog='dot', format=format)
     else:
-        g.write(outfile, prog='dot', format=format)
+        try:
+            g.write(outfile, prog='dot', format=format)
+        except pd.InvocationException:
+            # based on https://github.com/Theano/Theano/issues/2988
+            if map(int, pd.__version__.split(".")) < [1, 0, 28]:
+                raise Exception("Old version of pydot detected, which can "
+                                "cause issues with pydot printing. Try "
+                                "upgrading pydot version to a newer one")
+            raise
+
         if print_output_file:
             print('The output file is available at', outfile)
 
@@ -1014,7 +1045,7 @@ def pydotprint_variables(vars,
         my_list[app] = astr
 
         use_color = None
-        for opName, color in colorCodes.items():
+        for opName, color in iteritems(colorCodes):
             if opName in app.op.__class__.__name__:
                 use_color = color
 
