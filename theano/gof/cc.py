@@ -1070,7 +1070,6 @@ class CLinker(link.Linker):
           f()
           first_output = ostor[0].data
         """
-
         init_tasks, tasks = self.get_init_tasks()
 
         cthunk, in_storage, out_storage, error_storage, filename = self.__compile__(
@@ -1232,7 +1231,8 @@ class CLinker(link.Linker):
             for var in self.orphans:
                 if isinstance(var, graph.Constant):
                     constants_vals += str(var.data.flatten())
-            sig.append('costants: '+constants_vals)
+            if constants_vals != '':
+                sig.append('costants: '+constants_vals)
 
         error_on_play = [False]
 
