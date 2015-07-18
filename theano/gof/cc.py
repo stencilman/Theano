@@ -1,6 +1,7 @@
 """
 Defines Linkers that deal with C implementations.
 """
+
 from __future__ import print_function
 
 # Python imports
@@ -8,69 +9,37 @@ from copy import copy
 import os
 import re
 import sys
-from theano.compat import izip
+import logging
 
 import numpy
 
-from theano.compat import PY3
-from six import string_types, reraise
-from six.moves import StringIO, xrange
-from theano.gof.utils import MethodNotDefined
-from theano.misc.windows import call_subprocess_Popen
-
 import theano
 from theano import config
-
-if PY3:
-    import hashlib
-
-    def hash_from_code(msg):
-        # hashlib.md5() requires an object that supports buffer interface,
-        # but Python 3 (unicode) strings don't.
-        if isinstance(msg, str):
-            msg = msg.encode()
-        # Python 3 does not like module names that start with
-        # a digit.
-        return 'm' + hashlib.md5(msg).hexdigest()
-
-else:
-    import hashlib
-
-    def hash_from_code(msg):
-        try:
-            return hashlib.md5(msg).hexdigest()
-        except TypeError:
-            assert isinstance(msg, numpy.ndarray)
-            return hashlib.md5(numpy.getbuffer(msg)).hexdigest()
-
-
-def hash_from_file(file_path):
-    """Return the MD5 hash of a file."""
-    return hash_from_code(open(file_path, 'rb').read())
-
+from theano.compat import PY3
+from theano.compat import izip
+from six import string_types, reraise
+from six.moves import StringIO, xrange
 
 # Note that we need to do this before importing cutils, since when there is
 # no theano cache dir initialized yet, importing cutils may require compilation
 # of cutils_ext.
 from theano.configparser import AddConfigVar, StrParam
-AddConfigVar('gcc.cxxflags',
-             "Extra compiler flags for gcc",
-             StrParam(""))
 
 # gof imports
 from theano.gof import graph
 from theano.gof import link
 from theano.gof import utils
-
-from theano.gof.compilelock import get_lock, release_lock
-
 from theano.gof import cmodule
+from theano.gof.compilelock import get_lock, release_lock
+from theano.gof.callcache import CallCache
+
+AddConfigVar('gcc.cxxflags',
+             "Extra compiler flags for gcc",
+             StrParam(""))
 
 
-import logging
 _logger = logging.getLogger("theano.gof.cc")
 
-from theano.gof.callcache import CallCache
 
 run_cthunk = None  # Will be imported only when needed.
 
@@ -320,10 +289,16 @@ def get_nothing(r, name, sub):
 
 def get_c_declare(r, name, sub):
     """Wrapper around c_declare that declares py_name"""
-    if any([c != "output" and getattr(c.op, 'check_input',
-        config.check_input) for (c, _) in r.clients]) or (r.owner
-        and getattr(r.owner.op, 'check_input', True)):
-
+    # The declaration will be used by the Apply node that
+    # is computing it (`r.owner`), and by each of the clients.
+    # If some of these have `check_input=True` in their `.op`,
+    # it means they need `r`'s dtype to be declared, so
+    # we have to pass `check_input=True` to `c_declare`.
+    if ((any([getattr(c.op, 'check_input', config.check_input)
+              for (c, _) in r.clients
+              if not isinstance(c, string_types)]) or
+         (r.owner and
+          getattr(r.owner.op, 'check_input', config.check_input)))):
         c_declare = r.type.c_declare(name, sub, True)
     else:
         c_declare = r.type.c_declare(name, sub, False)
@@ -344,13 +319,21 @@ def get_c_init(r, name, sub):
 
 def get_c_extract(r, name, sub):
     """Wrapper around c_extract that initializes py_name from storage."""
-    if any([getattr(c.op, 'check_input', config.check_input) for (c, _) in
-            r.clients]):
+    # `c_extract` is called when getting the value of an apply node's
+    # input from the compute map, before being used by its clients.
+    # If one of the clients has `check_input=True`, we need to perform
+    # checks on the variable.
+    # However that code is not used by C code of the apply node creating
+    # this variable, so there is no need to check `r.owner.op.check_input`.
+    if any([getattr(c.op, 'check_input', config.check_input)
+            for (c, _) in r.clients
+            if not isinstance(c, string_types)]):
         # check_broadcast is just an hack to easily remove just the
         # broadcast check on the old GPU back-end. This check isn't
         # done in the new GPU back-end or on the CPU.
-        if any([getattr(c.op, 'check_broadcast', True) for (c, _) in
-                r.clients]):
+        if any([getattr(c.op, 'check_broadcast', True)
+                for (c, _) in r.clients
+                if not isinstance(c, string_types)]):
             c_extract = r.type.c_extract(name, sub, True)
         else:
             try:
@@ -371,10 +354,18 @@ def get_c_extract(r, name, sub):
 
 def get_c_extract_out(r, name, sub):
     """Wrapper around c_extract_out that initializes py_name from storage."""
+    # `c_extract_out` is used to extract an output variable from
+    # the compute map, to be used as pre-allocated memory for `r`
+    # before its value gets computed.
+    # If the node producing `r` has `check_inputs=True`, it may
+    # also perform type checks on the initial value of the output,
+    # so we need to pass `check_input=True` to `c_extract_out`.
+    # However, that code is not used by potential clients of `r`,
+    # so we do not need to check them.
+    check_input = getattr(r.owner.op, 'check_input', config.check_input)
     # check_broadcast is just an hack to easily remove just the
     # broadcast check on the old GPU back-end. This check isn't
     # done in the new GPU back-end or on the CPU.
-    check_input = getattr(r.owner.op, 'check_input', config.check_input)
     if getattr(r.owner.op, 'check_broadcast', True):
         c_extract = r.type.c_extract_out(name, sub, check_input)
     else:
@@ -540,7 +531,7 @@ class CLinker(link.Linker):
                             if isinstance(r, graph.Constant) and
                             r not in self.inputs)
         self.temps = list(set(self.variables).difference(
-                self.inputs).difference(self.outputs).difference(self.orphans))
+            self.inputs).difference(self.outputs).difference(self.orphans))
         self.consts = []
 
     def code_gen(self):
@@ -592,8 +583,10 @@ class CLinker(link.Linker):
             #            what to do at the beginning of each run,
             #            what to do at the end of each run]]
             if variable in self.inputs:
-                # we need to extract the new inputs at each run
-                # they do not need to be relayed to Python, so we don't sync
+                # We need to extract the new inputs at each run
+                # they do not need to be relayed to Python, so we don't sync.
+                # If the variable is both an input and an output, there is
+                # no need to synchronize either, it is already up-to-date.
                 policy = [[get_nothing, get_nothing, get_nothing],
                           [get_c_declare, get_c_extract, get_c_cleanup]]
             elif variable in self.orphans:
@@ -828,7 +821,7 @@ class CLinker(link.Linker):
         ret = []
         # generic support code
         for x in [y.type for y in self.variables] + [
-            y.op for y in self.node_order]:
+                y.op for y in self.node_order]:
             try:
                 ret.append(x.c_support_code())
             except utils.MethodNotDefined:
@@ -847,11 +840,11 @@ class CLinker(link.Linker):
 # FillMissing must disable some of them. Putting -ffast-math would
 # make it disable all other parameter at the same time.
         ret += ["-fno-math-errno",
-                #"-funsafe-math-optimizations",
-                #"-fno-signaling-nans",
-                #"-fcx-limited-range",
-                #"-fno-rounding-math",
-                #"-ffinite-math-only",
+                # "-funsafe-math-optimizations",
+                # "-fno-signaling-nans",
+                # "-fcx-limited-range",
+                # "-fno-rounding-math",
+                # "-ffinite-math-only",
 
                 # the current code generate label event if they are not used.
                 # Could use gcc attribute for those label only
@@ -860,7 +853,7 @@ class CLinker(link.Linker):
                 "-Wno-write-strings",  # generated by our code generator...
                 ]
         for x in [y.type for y in self.variables] + [
-            y.op for y in self.node_order]:
+                y.op for y in self.node_order]:
             try:
                 ret += x.c_compile_args()
             except utils.MethodNotDefined:
@@ -873,7 +866,7 @@ class CLinker(link.Linker):
         # to reorder them
         ret += c_compiler.compile_args()
         for x in [y.type for y in self.variables] + [
-            y.op for y in self.node_order]:
+                y.op for y in self.node_order]:
             try:
                 for i in x.c_no_compile_args():
                     try:
@@ -893,7 +886,7 @@ class CLinker(link.Linker):
         """
         ret = []
         for x in [y.type for y in self.variables] + [
-            y.op for y in self.node_order]:
+                y.op for y in self.node_order]:
             try:
                 ret += x.c_headers()
             except utils.MethodNotDefined:
@@ -908,7 +901,7 @@ class CLinker(link.Linker):
         """
         ret = []
         for x in [y.type for y in self.variables] + [
-            y.op for y in self.node_order]:
+                y.op for y in self.node_order]:
             try:
                 ret += x.c_init_code()
             except utils.MethodNotDefined:
@@ -918,7 +911,7 @@ class CLinker(link.Linker):
     def c_compiler(self):
         c_compiler = None
         for x in [y.type for y in self.variables] + [
-            y.op for y in self.node_order]:
+                y.op for y in self.node_order]:
             if hasattr(x, 'c_compiler'):
                 x_compiler = x.c_compiler()
             else:
@@ -945,7 +938,7 @@ class CLinker(link.Linker):
         """
         ret = []
         for x in [y.type for y in self.variables] + [
-            y.op for y in self.node_order]:
+                y.op for y in self.node_order]:
             try:
                 ret += x.c_header_dirs()
             except utils.MethodNotDefined:
@@ -961,7 +954,7 @@ class CLinker(link.Linker):
         """
         ret = []
         for x in [y.type for y in self.variables] + [
-            y.op for y in self.node_order]:
+                y.op for y in self.node_order]:
             try:
                 ret += x.c_libraries()
             except utils.MethodNotDefined:
@@ -977,7 +970,7 @@ class CLinker(link.Linker):
         """
         ret = []
         for x in [y.type for y in self.variables] + [
-            y.op for y in self.node_order]:
+                y.op for y in self.node_order]:
             try:
                 ret += x.c_lib_dirs()
             except utils.MethodNotDefined:
@@ -1005,6 +998,10 @@ class CLinker(link.Linker):
         if output_storage is None:
             map = {}
             output_storage = []
+            # Initialize the map with the inputs, as some outputs may
+            # be inputs as well.
+            for i, variable in enumerate(self.inputs):
+                map[variable] = input_storage[i]
             for variable in self.outputs:
                 if variable not in map:
                     map[variable] = [None]
@@ -1365,6 +1362,8 @@ class CLinker(link.Linker):
             # yet computer, but we need to add the include to compute the hash.
             filename_h = os.path.join(location, mod.hash_placeholder + '.h')
             mod.add_include(filename_h)
+
+        # We want to compute the code without the lock
         src_code = mod.code()
         if self.c_callable:
             filename_h = os.path.join(location, '%s.h' % mod.code_hash)
@@ -1372,108 +1371,105 @@ class CLinker(link.Linker):
         get_lock()
         try:
             _logger.debug("LOCATION %s", str(location))
+            module = c_compiler.compile_str(
+                module_name=mod.code_hash,
+                src_code=mod.code(),
+                location=location,
+                include_dirs=self.header_dirs(),
+                lib_dirs=self.lib_dirs(),
+                libs=libs,
+                preargs=preargs)
 
-            try:
-                module = c_compiler.compile_str(
+            if self.c_callable:
+                # The main of the executable need the hash of the
+                # shared lib.
+                main = re.sub(mod.hash_placeholder, mod.code_hash,
+                              self.c_main())
+
+                mod_exec = cmodule.DynamicModule()
+                for header in self.headers():
+                    mod_exec.add_include(header)
+                mod_exec.add_include(filename_h)
+                mod_exec.add_support_code(main)
+                makefile = c_compiler.make_makefile(
                     module_name=mod.code_hash,
-                    src_code=mod.code(),
                     location=location,
                     include_dirs=self.header_dirs(),
                     lib_dirs=self.lib_dirs(),
                     libs=libs,
                     preargs=preargs)
+                f = open(os.path.join(location, 'makefile'), 'w')
+                print(makefile, file=f)
+                f.close()
+                # Put the command line in the header code so that
+                # other people know how to recompile the shared lib
+                mod_exec.add_header_code(
+                    "//command line used to compile the shared lib: \n" +
+                    "//" + ' '.join(
+                        c_compiler.compile_command(
+                            module_name=mod.code_hash,
+                            location=location,
+                            include_dirs=self.header_dirs(),
+                            lib_dirs=self.lib_dirs(),
+                            libs=libs,
+                            preargs=preargs)[2]))
 
-                if self.c_callable:
-                    # The main of the executable need the hash of the
-                    # shared lib.
-                    main = re.sub(mod.hash_placeholder, mod.code_hash,
-                              self.c_main())
+                # Make the executable link to the shared lib.
+                preargs.append(os.path.join(location, mod.code_hash + "." +
+                                            cmodule.get_lib_extension()))
+                # Make the executable
+                mod_exec.add_header_code(
+                    "//command line used to compile the executable: \n" +
+                    "//" + ' '.join(
+                        c_compiler.compile_command(
+                            module_name=mod_exec.code_hash,
+                            location=location,
+                            include_dirs=self.header_dirs(),
+                            lib_dirs=self.lib_dirs(),
+                            libs=libs,
+                            preargs=preargs,
+                            shared=False, py_module=False,
+                            code_filename='exec.cpp',
+                            out_filename='exec')[2]))
 
-                    mod_exec = cmodule.DynamicModule()
-                    for header in self.headers():
-                        mod_exec.add_include(header)
-                    mod_exec.add_include(filename_h)
-                    mod_exec.add_support_code(main)
-                    makefile = c_compiler.make_makefile(
-                        module_name=mod.code_hash,
-                        location=location,
-                        include_dirs=self.header_dirs(),
-                        lib_dirs=self.lib_dirs(),
-                        libs=libs,
-                        preargs=preargs)
-                    f = open(os.path.join(location, 'makefile'), 'w')
-                    print(makefile, file=f)
-                    f.close()
-                    # Put the command line in the header code so that
-                    # other people know how to recompile the shared lib
-                    mod_exec.add_header_code(
-                        "//command line used to compile the shared lib: \n" +
-                        "//" + ' '.join(
-                            c_compiler.compile_command(
-                                module_name=mod.code_hash,
-                                location=location,
-                                include_dirs=self.header_dirs(),
-                                lib_dirs=self.lib_dirs(),
-                                libs=libs,
-                                preargs=preargs)[2]))
+                # compile the dynamic python module.
+                src_code = mod_exec.code(executable=True)
+                c_compiler.compile_str(
+                    module_name=mod_exec.code_hash,
+                    src_code=src_code,
+                    location=location,
+                    include_dirs=self.header_dirs(),
+                    lib_dirs=self.lib_dirs(),
+                    libs=libs,
+                    preargs=preargs,
+                    shared=False, py_module=False,
+                    code_filename='exec.cpp',
+                    out_filename='exec')
+                mod_exec.gen_header(os.path.join(location, 'exec.h'))
+                if sys.platform == "win32" and False:
+                    # I don't know why it work now, but this was needed in the past.
+                    # As this is complicated to find how to do it, I keep it here
+                    # just in case.
+                    mt = r"C:\Program Files (x86)\Microsoft SDKs\Windows\v7.0A\Bin\mt.exe"
+                    pp = [p for p in sys.path
+                          if os.path.exists(os.path.join(p, 'python27.dll'))]
+                    # Try the first path found. Currently there is 2 of
+                    # them that have the same file size.
+                    py_dll = os.path.join(pp[-1], "python27.dll")
+                    manifest = os.path.join(location, "py_dll.manifest")
+                    exec_f = os.path.join(location, "exec.exe")
+                    call_subprocess_Popen('"' + mt + '"' +
+                                          " -inputresource:" + py_dll + ";#2 -out:" + manifest)
+                    call_subprocess_Popen('"' + mt + '"' +
+                                        " -manifest " + manifest +
+                                          " -outputresource:" + exec_f)
 
-                    # Make the executable link to the shared lib.
-                    preargs.append(os.path.join(location, mod.code_hash + "." +
-                                                cmodule.get_lib_extension()))
-                    # Make the executable
-                    mod_exec.add_header_code(
-                        "//command line used to compile the executable: \n" +
-                        "//" + ' '.join(
-                            c_compiler.compile_command(
-                                module_name=mod_exec.code_hash,
-                                location=location,
-                                include_dirs=self.header_dirs(),
-                                lib_dirs=self.lib_dirs(),
-                                libs=libs,
-                                preargs=preargs,
-                                shared=False, py_module=False,
-                                code_filename='exec.cpp',
-                                out_filename='exec')[2]))
-
-                    # compile the dynamic python module.
-                    src_code = mod_exec.code(executable=True)
-                    c_compiler.compile_str(
-                        module_name=mod_exec.code_hash,
-                        src_code=src_code,
-                        location=location,
-                        include_dirs=self.header_dirs(),
-                        lib_dirs=self.lib_dirs(),
-                        libs=libs,
-                        preargs=preargs,
-                        shared=False, py_module=False,
-                        code_filename='exec.cpp',
-                        out_filename='exec')
-                    mod_exec.gen_header(os.path.join(location, 'exec.h'))
-                    if sys.platform == "win32" and False:
-                        # I don't know why it work now, but this was needed in the past.
-                        # As this is complicated to find how to do it, I keep it here
-                        # just in case.
-                        mt = r"C:\Program Files (x86)\Microsoft SDKs\Windows\v7.0A\Bin\mt.exe"
-                        pp = [p for p in sys.path
-                              if os.path.exists(os.path.join(p, 'python27.dll'))]
-                        # Try the first path found. Currently there is 2 of
-                        # them that have the same file size.
-                        py_dll = os.path.join(pp[-1], "python27.dll")
-                        manifest = os.path.join(location, "py_dll.manifest")
-                        exec_f = os.path.join(location, "exec.exe")
-                        call_subprocess_Popen('"' + mt + '"' +
-                                            " -inputresource:" + py_dll + ";#2 -out:" + manifest)
-                        call_subprocess_Popen('"' + mt + '"' +
-                            " -manifest " + manifest +
-                            " -outputresource:" + exec_f)
-
-            except Exception, e:
-                e.args += (str(self.fgraph),)
-                raise
+        except Exception, e:
+            e.args += (str(self.fgraph),)
+            raise
         finally:
             release_lock()
         return module
-
 
     def get_dynamic_module(self):
         """Return a cmodule.DynamicModule instance full of the code
@@ -1812,7 +1808,7 @@ class _CThunk(object):
         global run_cthunk
         if run_cthunk is None:
             # Lazy import to avoid compilation when importing theano.
-            from theano.gof.cutils import run_cthunk
+            from theano.gof.cutils import run_cthunk  # noqa
         self.cthunk = cthunk
         self.init_tasks = init_tasks
         self.tasks = tasks
@@ -1849,7 +1845,8 @@ class _CThunk(object):
                 exc_value.__thunk_trace__ = trace
             except Exception:
                 print(('ERROR retrieving error_storage.'
-                                      ' Was the error set in the c code?'), end=' ', file=sys.stderr)
+                       'Was the error set in the c code?'),
+                      end=' ', file=sys.stderr)
                 print(self.error_storage, file=sys.stderr)
                 raise
             reraise(exc_type, exc_value, exc_trace)
@@ -1956,11 +1953,11 @@ class OpWiseCLinker(link.LocalLinker):
 
             for node in order:
                 if self.allow_gc:
-                    post_thunk_old_storage.append([storage_map[input]
-                        for input in node.inputs
-                        if ((input in computed) and
-                            (input not in fgraph.outputs) and
-                            node == last_user[input])])
+                    post_thunk_old_storage.append(
+                        [storage_map[input] for input in node.inputs
+                         if ((input in computed) and
+                             (input not in fgraph.outputs) and
+                             node == last_user[input])])
 
             if no_recycling is True:
                 no_recycling = list(storage_map.values())
@@ -2056,12 +2053,12 @@ class DualLinker(link.Linker):
         no_recycling = self.no_recycling
 
         _f, i1, o1, thunks1, order1 = (
-                link.PerformLinker(schedule=self.schedule).accept(fgraph,
-                                no_recycling=no_recycling).make_all(**kwargs))
+            link.PerformLinker(schedule=self.schedule).accept(
+                fgraph, no_recycling=no_recycling).make_all(**kwargs))
         kwargs.pop('input_storage', None)
         _f, i2, o2, thunks2, order2 = (
-                OpWiseCLinker(schedule=self.schedule).accept(fgraph,
-                                no_recycling=no_recycling).make_all(**kwargs))
+            OpWiseCLinker(schedule=self.schedule).accept(
+                fgraph, no_recycling=no_recycling).make_all(**kwargs))
 
         def f():
             for input1, input2 in izip(i1, i2):

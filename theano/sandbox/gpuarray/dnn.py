@@ -2,50 +2,72 @@ import os
 import numpy
 
 import theano
-from theano import Apply, gof, tensor, config, Variable
+from theano import Op, Apply, tensor, config, Variable
 from theano.scalar import as_scalar, constant
 from theano.gradient import DisconnectedType, grad_not_implemented
 from theano.gof import Optimizer, local_optimizer, COp
+from theano.gof.cmodule import GCC_compiler
 from theano.gof.type import CDataType, Generic
 from theano.compile import optdb
 from theano.compile.ops import shape_i
-from theano.configparser import AddConfigVar, EnumStr
+from theano.configparser import AddConfigVar, EnumStr, StrParam
 from theano.tensor.nnet import SoftmaxGrad
 from theano.tensor.signal.downsample import (
     DownsampleFactorMax, DownsampleFactorMaxGrad)
-from theano.sandbox.cuda import GpuOp
-from theano.sandbox.cuda.basic_ops import (as_cuda_ndarray_variable,
-                                           host_from_gpu,
-                                           gpu_contiguous, HostFromGpu,
-                                           gpu_alloc_empty, GpuAllocEmpty)
-from theano.sandbox.cuda.blas import (GpuConv, GpuDownsampleFactorMax,
-                                      GpuDownsampleFactorMaxGrad)
-from theano.sandbox.cuda.nnet import GpuSoftmax
-from theano.sandbox.cuda.opt_util import alpha_merge, output_merge
-from theano.sandbox.cuda import gpu_seqopt, register_opt
 
-from theano.sandbox.cuda.nvcc_compiler import NVCC_compiler
+from . import pygpu, init_dev
+from .basic_ops import (as_gpuarray_variable,
+                        gpu_contiguous, HostFromGpu,
+                        GpuAllocEmpty, empty_like)
+from .conv import GpuConv
+
+# These don't exist in gpuarray
+# GpuDownsampleFactorMax, GpuDownsampleFactorMaxGrad
+from .nnet import GpuSoftmax
+from .opt import gpu_seqopt, register_opt, conv_groupopt, op_lifter
+from .opt_util import alpha_merge, output_merge
+
+# This is to avoid conflict with the one in cuda/dnn.py
+if not hasattr(config, 'dnn'):
+    AddConfigVar('dnn.conv.workmem',
+                 "Default value for the workmem attribute of cudnn "
+                 "convolutions.",
+                 EnumStr('small', 'none', 'large'),
+                 in_c_key=False)
+
+AddConfigVar('dnn.include_path',
+             "Location of the cudnn header (defaults to the cuda root)",
+             StrParam(lambda: os.path.join(config.cuda.root, 'include')))
+
+AddConfigVar('dnn.library_path',
+             "Location of the cudnn header (defaults to the cuda root)",
+             StrParam(lambda: os.path.join(config.cuda.root, 'lib64')))
 
 
 def dnn_available():
-    if dnn_available.avail is None:
-        if not theano.sandbox.cuda.cuda_available:
-            dnn_available.msg = "CUDA not available"
-            dnn_available.avail = False
-            return False
-        dev = theano.sandbox.cuda.active_device_number()
-        if theano.sandbox.cuda.device_properties(dev)['major'] < 3:
-            dnn_available.msg = "Device not supported by cuDNN"
-            dnn_available.avail = False
-        else:
-            preambule = """
+    if dnn_available.avail is not None:
+        return dnn_available.avail
+    if pygpu is None:
+        dnn_available.msg = "PyGPU not available"
+        dnn_available.avail = False
+        return False
+    if not init_dev.device.startswith('cuda'):
+        dnn_available.msg = "Not on a CUDA device. Got %s." % init_dev.device
+        dnn_available.avail = False
+        return False
+    # This is a hack because bin_id is in the from of
+    # "sm_<major><minor>" for cuda devices.
+    if pygpu.get_default_context().bin_id < 'sm_30':
+        dnn_available.msg = "Device not supported by cuDNN"
+        dnn_available.avail = False
+    preambule = """
 #include <stdio.h>
 #include <cuda.h>
 #include <cudnn.h>
 #include <cudnn_helper.h>
-            """
+"""
 
-            body = """
+    body = """
 cudnnHandle_t _handle = NULL;
 cudnnStatus_t err;
 if ((err = cudnnCreate(&_handle)) != CUDNN_STATUS_SUCCESS) {
@@ -54,39 +76,38 @@ if ((err = cudnnCreate(&_handle)) != CUDNN_STATUS_SUCCESS) {
   return 1;
 }
 """
-            # Do not run here the test program. It would run on the
-            # default gpu, not the one selected by the user. If mixed
-            # GPU are installed or if the GPUs are configured in
-            # exclusive mode, this cause bad detection.
-            comp, out, err = NVCC_compiler.try_flags(
-                ["-l", "cudnn", "-I" + os.path.dirname(__file__),
-                 "-I" + os.path.join(theano.config.cuda.root, 'include'),
-                 "-L" + os.path.join(theano.config.cuda.root, 'lib64')],
-                preambule=preambule, body=body,
-                try_run=False, output=True)
+    # Do not run here the test program. It would run on the
+    # default gpu, not the one selected by the user. If mixed
+    # GPU are installed or if the GPUs are configured in
+    # exclusive mode, this cause bad detection.
+    comp, out, err = GCC_compiler.try_flags(
+        ["-l", "cudnn", "-I" + os.path.dirname(__file__),
+         "-I" + config.dnn.include_path,
+         "-L" + config.dnn.library_path],
+        preambule=preambule, body=body,
+        try_run=False, output=True)
 
-            dnn_available.avail = comp
-            if not dnn_available.avail:
-                dnn_available.msg = (
-                    "Theano can not compile with cuDNN. We got this error:\n" +
-                    str(err))
-            else:
-                # If we can compile, check that we can import and run.
-                v = version()
-                if isinstance(v, tuple) and v[0] != v[1]:
-                    dnn_available.avail = False
-                    dnn_available.msg = ("Mixed dnn version. The header is"
-                                         " from one version, but we link with"
-                                         " a different version %s" % str(v))
-                    raise RuntimeError(dnn_available.msg)
-                if version() == (20, 20):
-                    dnn_available.avail = False
-                    dnn_available.msg = (
-                        "You have installed a release candidate of CuDNN v2."
-                        " This isn't supported anymore."
-                        " Update to CuDNN v2 final version.")
-                    raise RuntimeError(dnn_available.msg)
-
+    dnn_available.avail = comp
+    if not dnn_available.avail:
+        dnn_available.msg = (
+            "Theano cannot compile with cuDNN. We got this error:\n" +
+            str(err))
+    else:
+        # If we can compile, check that we can import and run.
+        v = version()
+        if isinstance(v, tuple) and v[0] != v[1]:
+            dnn_available.avail = False
+            dnn_available.msg = ("Mixed dnn version. The header is"
+                                 " from one version, but we link with"
+                                 " a different version %s" % str(v))
+            raise RuntimeError(dnn_available.msg)
+        if version() == (20, 20):
+            dnn_available.avail = False
+            dnn_available.msg = (
+                "You have installed a release candidate of CuDNN v2."
+                " This isn't supported anymore."
+                " Update to CuDNN v2 final version.")
+            raise RuntimeError(dnn_available.msg)
     return dnn_available.avail
 
 
@@ -97,38 +118,46 @@ dnn_available.msg = None
 def c_set_tensor4d(var, desc, err, fail):
     return """
 {
-    int str0, str1, str2, str3;
-    str3 = CudaNdarray_HOST_STRIDES(%(var)s)[3]?CudaNdarray_HOST_STRIDES(%(var)s)[3]:1;
-    str2 = CudaNdarray_HOST_STRIDES(%(var)s)[2]?CudaNdarray_HOST_STRIDES(%(var)s)[2]:CudaNdarray_HOST_DIMS(%(var)s)[3];
-    str1 = CudaNdarray_HOST_STRIDES(%(var)s)[1]?CudaNdarray_HOST_STRIDES(%(var)s)[1]:CudaNdarray_HOST_DIMS(%(var)s)[2]*CudaNdarray_HOST_DIMS(%(var)s)[3];
-    str0 = CudaNdarray_HOST_STRIDES(%(var)s)[0]?CudaNdarray_HOST_STRIDES(%(var)s)[0]:CudaNdarray_HOST_DIMS(%(var)s)[2]*CudaNdarray_HOST_DIMS(%(var)s)[3]*CudaNdarray_HOST_DIMS(%(var)s)[1];
-%(err)s = cudnnSetTensor4dDescriptorEx(
-    %(desc)s, CUDNN_DATA_FLOAT,
-    CudaNdarray_HOST_DIMS(%(var)s)[0],
-    CudaNdarray_HOST_DIMS(%(var)s)[1],
-    CudaNdarray_HOST_DIMS(%(var)s)[2],
-    CudaNdarray_HOST_DIMS(%(var)s)[3],
-    str0, str1, str2, str3
-);
-if (%(err)s != CUDNN_STATUS_SUCCESS) {
-    PyErr_Format(PyExc_RuntimeError,
-    "could not set tensor4d descriptor: %%s"
-    "shapes=%%d %%d %%d %%d strides=%%d %%d %%d %%d",
-    cudnnGetErrorString(%(err)s),
-    CudaNdarray_HOST_DIMS(%(var)s)[0],
-    CudaNdarray_HOST_DIMS(%(var)s)[1],
-    CudaNdarray_HOST_DIMS(%(var)s)[2],
-    CudaNdarray_HOST_DIMS(%(var)s)[3],
-    str0, str1, str2, str3
-    );
-    %(fail)s
-}
-}
+  cudnnDataType_t dt;
+  size_t ds;
+  switch (%(var)s->ga.typecode) {
+  case GA_FLOAT:
+    dt = CUDNN_DATA_FLOAT;
+    break;
+  case GA_DOUBLE:
+    dt = CUDNN_DATA_DOUBLE;
+    break;
+  default:
+    PyErr_SetString(PyExc_TypeError, "Non-float datatype in c_set_tensor4d");
+    return -1;
+  }
+  ds = gpuarray_get_elsize(%(var)s->ga.typecode);
 
+  int str0, str1, str2, str3;
+  // cudnn do not like 0s in strides
+  str3 = PyGpuArray_STRIDES(%(var)s)[3]?PyGpuArray_STRIDES(%(var)s)[3]/ds:1;
+  str2 = PyGpuArray_STRIDES(%(var)s)[2]?PyGpuArray_STRIDES(%(var)s)[2]/ds:PyGpuArray_DIMS(%(var)s)[3];
+  str1 = PyGpuArray_STRIDES(%(var)s)[1]?PyGpuArray_STRIDES(%(var)s)[1]/ds:PyGpuArray_DIMS(%(var)s)[2]*PyGpuArray_DIMS(%(var)s)[3];
+  str0 = PyGpuArray_STRIDES(%(var)s)[0]?PyGpuArray_STRIDES(%(var)s)[0]/ds:PyGpuArray_DIMS(%(var)s)[2]*PyGpuArray_DIMS(%(var)s)[3]*PyGpuArray_DIMS(%(var)s)[1];
+  %(err)s = cudnnSetTensor4dDescriptorEx(
+    %(desc)s, dt,
+    PyGpuArray_DIMS(%(var)s)[0],
+    PyGpuArray_DIMS(%(var)s)[1],
+    PyGpuArray_DIMS(%(var)s)[2],
+    PyGpuArray_DIMS(%(var)s)[3],
+    str0, str1, str2, str3);
+
+  if (%(err)s != CUDNN_STATUS_SUCCESS) {
+    PyErr_Format(PyExc_RuntimeError,
+    "could not set tensor4d descriptor: %%s",
+    cudnnGetErrorString(%(err)s));
+    %(fail)s
+  }
+}
         """ % dict(var=var, err=err, desc=desc, fail=fail)
 
 
-class DnnBase(GpuOp, COp):
+class DnnBase(COp):
     """
     Creates a handle for cudnn and pulls in the cudnn libraries and headers.
     """
@@ -140,24 +169,33 @@ class DnnBase(GpuOp, COp):
         COp.__init__(self, "dnn_base.c")
 
     def c_headers(self):
-        return ['cudnn.h', 'cudnn_helper.h']
+        return ['cudnn.h', 'cudnn_helper.h', 'gpuarray_helper.h',
+                'gpuarray/types.h', 'gpuarray/array.h', 'gpuarray/util.h',
+                'gpuarray_api.h', 'numpy_compat.h']
 
     def c_header_dirs(self):
-        return [os.path.dirname(__file__)]
+        return [os.path.dirname(__file__), pygpu.get_include(),
+                config.dnn.include_path]
 
     def c_libraries(self):
-        return ['cudnn']
+        return ['cudnn', 'gpuarray']
+
+    def c_lib_dirs(self):
+        return [config.dnn.library_path]
 
 
-class DnnVersion(GpuOp):
-    def c_compiler(self):
-        return NVCC_compiler
-
+class DnnVersion(Op):
     def c_headers(self):
         return ['cudnn.h']
 
+    def c_header_dirs(self):
+        return [config.dnn.include_path]
+
     def c_libraries(self):
         return ['cudnn']
+
+    def c_lib_dirs(self):
+        return [config.dnn.library_path]
 
     def c_support_code(self):
         return """
@@ -210,7 +248,7 @@ def version():
 version.v = None
 
 
-class GpuDnnConvDesc(GpuOp):
+class GpuDnnConvDesc(Op):
     """This Op builds a convolution descriptor for use in the other
     convolution operations.
 
@@ -223,13 +261,13 @@ class GpuDnnConvDesc(GpuOp):
         return ['cudnn.h', 'cudnn_helper.h']
 
     def c_header_dirs(self):
-        return [os.path.dirname(__file__)]
+        return [os.path.dirname(__file__), config.dnn.include_path]
 
     def c_libraries(self):
         return ['cudnn']
 
-    def c_compiler(self):
-        return NVCC_compiler
+    def c_lib_dirs(self):
+        return [config.dnn.library_path]
 
     def __init__(self, border_mode, subsample=(1, 1), conv_mode='conv'):
         if isinstance(border_mode, int):
@@ -342,30 +380,24 @@ class GpuDnnConvDesc(GpuOp):
            pad_h_spec=pad_h_spec, pad_w_spec=pad_w_spec)
 
     def c_code_cache_version(self):
-        return (2, version())
-
-
-AddConfigVar('dnn.conv.workmem',
-             "Default value for the workmem attribute of cudnn convolutions.",
-             EnumStr('small', 'none', 'large'),
-             in_c_key=False)
+        return (1, version())
 
 # scalar constants
-_zero = constant(numpy.asarray(0.0, dtype='float32'))
-_one = constant(numpy.asarray(1.0, dtype='float32'))
+_zero = constant(numpy.asarray(0.0, dtype='float64'))
+_one = constant(numpy.asarray(1.0, dtype='float64'))
 
 
-def ensure_float(val, default, name):
+def ensure_dt(val, default, name, dtype):
     if val is None:
-        return default.clone()
+        val = default.clone()
     if not isinstance(val, Variable):
         val = constant(val)
     if hasattr(val, 'ndim') and val.ndim == 0:
         val = as_scalar(val)
     if not isinstance(val.type, theano.scalar.Scalar):
         raise TypeError("%s: expected a scalar value" % (name,))
-    if not val.type.dtype == 'float32':
-        raise TypeError("%s: type is not float32" % (name,))
+    if not val.type.dtype == dtype:
+        val = val.astype(dtype)
     return val
 
 
@@ -378,8 +410,6 @@ class GpuDnnConv(DnnBase, COp):
     :param descr: the convolution descriptor
     """
     __props__ = ('workmem', 'inplace')
-    __input_name__ = ('image', 'kernel', 'output',
-                      'descriptor', 'alpha', 'beta')
 
     def __init__(self, workmem=None, inplace=False):
         """
@@ -395,13 +425,6 @@ class GpuDnnConv(DnnBase, COp):
         if self.inplace:
             self.destroy_map = {0: [2]}
         assert self.workmem in ['none', 'small', 'large']
-
-    def __setstate__(self, d):
-        self.__dict__.update(d)
-        if not hasattr(self, 'workmem'):
-            self.workmem = 'none'
-        if not hasattr(self, 'inplace'):
-            self.inplace = False
 
     def get_op_params(self):
         if self.inplace:
@@ -421,9 +444,9 @@ class GpuDnnConv(DnnBase, COp):
         return [alg_def] + inpl_def
 
     def make_node(self, img, kern, output, desc, alpha=None, beta=None):
-        img = as_cuda_ndarray_variable(img)
-        kern = as_cuda_ndarray_variable(kern)
-        output = as_cuda_ndarray_variable(output)
+        img = as_gpuarray_variable(img)
+        kern = as_gpuarray_variable(kern)
+        output = as_gpuarray_variable(output)
         if img.type.ndim != 4:
             raise TypeError('img must be 4D tensor')
         if kern.type.ndim != 4:
@@ -435,8 +458,8 @@ class GpuDnnConv(DnnBase, COp):
                 or desc.type.ctype != 'cudnnConvolutionDescriptor_t':
             raise TypeError('desc must be cudnnConvolutionDescriptor_t')
 
-        alpha = ensure_float(alpha, _one, 'alpha')
-        beta = ensure_float(beta, _zero, 'beta')
+        alpha = ensure_dt(alpha, _one, 'alpha', img.dtype)
+        beta = ensure_dt(beta, _zero, 'beta', img.dtype)
 
         return Apply(self, [img, kern, output, desc, alpha, beta],
                      [output.type()])
@@ -447,8 +470,8 @@ class GpuDnnConv(DnnBase, COp):
 
         top = gpu_contiguous(top)
 
-        d_img = GpuDnnConvGradI()(kerns, top, gpu_alloc_empty(*img.shape), desc)
-        d_kerns = GpuDnnConvGradW()(img, top, gpu_alloc_empty(*kerns.shape), desc)
+        d_img = GpuDnnConvGradI()(kerns, top, empty_like(img), desc)
+        d_kerns = GpuDnnConvGradW()(img, top, empty_like(kerns), desc)
         d_alpha = grad_not_implemented(self, 4, alpha)
         d_beta = grad_not_implemented(self, 5, beta)
 
@@ -486,8 +509,8 @@ class GpuDnnConv(DnnBase, COp):
 
         return (
             b, nb,
-            (h + 2*padh - kh)//sh + 1,
-            (w + 2*padw - kw)//sw + 1
+            (h + 2 * padh - kh) // sh + 1,
+            (w + 2 * padw - kw) // sw + 1
         )
 
     def infer_shape(self, node, shape):
@@ -504,7 +527,6 @@ class GpuDnnConvGradW(DnnBase, COp):
 
     """
     __props__ = ('inplace',)
-    __input_name__ = ('image', 'grad', 'output', 'descriptor', 'alpha', 'beta')
 
     def __init__(self, inplace=False):
         COp.__init__(self, ["dnn_base.c", "dnn_conv_base.c", "dnn_gw.c"],
@@ -524,8 +546,8 @@ class GpuDnnConvGradW(DnnBase, COp):
 
         kerns = gpu_contiguous(kerns)
 
-        d_img = GpuDnnConvGradI()(kerns, top, gpu_alloc_empty(*img.shape), desc)
-        d_top = GpuDnnConv()(img, kerns, gpu_alloc_empty(*top.shape), desc)
+        d_img = GpuDnnConvGradI()(kerns, top, empty_like(img), desc)
+        d_top = GpuDnnConv()(img, kerns, empty_like(top), desc)
         d_alpha = grad_not_implemented(self, 4, alpha)
         d_beta = grad_not_implemented(self, 5, beta)
 
@@ -543,9 +565,9 @@ class GpuDnnConvGradW(DnnBase, COp):
             return []
 
     def make_node(self, img, topgrad, output, desc, alpha=None, beta=None):
-        img = as_cuda_ndarray_variable(img)
-        topgrad = as_cuda_ndarray_variable(topgrad)
-        output = as_cuda_ndarray_variable(output)
+        img = as_gpuarray_variable(img)
+        topgrad = as_gpuarray_variable(topgrad)
+        output = as_gpuarray_variable(output)
         if img.type.ndim != 4:
             raise TypeError('img must be 4D tensor')
         if topgrad.type.ndim != 4:
@@ -557,8 +579,8 @@ class GpuDnnConvGradW(DnnBase, COp):
                 or desc.type.ctype != 'cudnnConvolutionDescriptor_t':
             raise TypeError('desc must be cudnnConvolutionDescriptor_t')
 
-        alpha = ensure_float(alpha, _one, 'alpha')
-        beta = ensure_float(beta, _zero, 'beta')
+        alpha = ensure_dt(alpha, _one, 'alpha', img.dtype)
+        beta = ensure_dt(beta, _zero, 'beta', img.dtype)
 
         return Apply(self, [img, topgrad, output, desc, alpha, beta],
                      [output.type()])
@@ -567,7 +589,7 @@ class GpuDnnConvGradW(DnnBase, COp):
         return [shape[2]]
 
 
-class GpuDnnConvGradI(DnnBase, COp):
+class GpuDnnConvGradI(DnnBase):
     """
     The convolution gradient with respect to the inputs.
 
@@ -577,8 +599,6 @@ class GpuDnnConvGradI(DnnBase, COp):
 
     """
     __props__ = ('inplace',)
-    __input_name__ = ('kernel', 'grad', 'output',
-                      'descriptor', 'alpha', 'beta')
 
     def __init__(self, inplace=False):
         COp.__init__(self, ["dnn_base.c", "dnn_conv_base.c", "dnn_gi.c"],
@@ -593,8 +613,8 @@ class GpuDnnConvGradI(DnnBase, COp):
 
         img = gpu_contiguous(img)
 
-        d_kerns = GpuDnnConvGradW()(img, top, gpu_alloc_empty(*kerns.shape), desc)
-        d_top = GpuDnnConv()(img, kerns, gpu_alloc_empty(*top.shape), desc)
+        d_kerns = GpuDnnConvGradW()(img, top, empty_like(kerns), desc)
+        d_top = GpuDnnConv()(img, kerns, empty_like(top), desc)
         d_alpha = grad_not_implemented(self, 4, alpha)
         d_beta = grad_not_implemented(self, 5, beta)
 
@@ -612,9 +632,9 @@ class GpuDnnConvGradI(DnnBase, COp):
             return []
 
     def make_node(self, kern, topgrad, output, desc, alpha=None, beta=None):
-        kern = as_cuda_ndarray_variable(kern)
-        topgrad = as_cuda_ndarray_variable(topgrad)
-        output = as_cuda_ndarray_variable(output)
+        kern = as_gpuarray_variable(kern)
+        topgrad = as_gpuarray_variable(topgrad)
+        output = as_gpuarray_variable(output)
         if kern.type.ndim != 4:
             raise TypeError('kern must be 4D tensor')
         if topgrad.type.ndim != 4:
@@ -626,8 +646,8 @@ class GpuDnnConvGradI(DnnBase, COp):
                 or desc.type.ctype != 'cudnnConvolutionDescriptor_t':
             raise TypeError('desc must be cudnnConvolutionDescriptor_t')
 
-        alpha = ensure_float(alpha, _one, 'alpha')
-        beta = ensure_float(beta, _zero, 'beta')
+        alpha = ensure_dt(alpha, _one, 'alpha', kern.dtype)
+        beta = ensure_dt(beta, _zero, 'beta', kern.dtype)
 
         return Apply(self, [kern, topgrad, output, desc, alpha, beta],
                      [output.type()])
@@ -671,7 +691,7 @@ def dnn_conv(img, kerns, border_mode='valid', subsample=(1, 1),
     """
     fgraph = getattr(img, 'fgraph', None) or getattr(kerns, 'fgraph', None)
     if (border_mode == 'valid' and subsample == (1, 1) and
-        direction_hint == 'bprop weights'):
+            direction_hint == 'bprop weights'):
         # Special case: We are asked to use GpuDnnConvGradW. We need to set
         # up a suitable 'fake' convolution to compute the gradient for.
         img = gpu_contiguous(img.dimshuffle(1, 0, 2, 3))
@@ -682,12 +702,12 @@ def dnn_conv(img, kerns, border_mode='valid', subsample=(1, 1),
         kerns = gpu_contiguous(kerns.dimshuffle(1, 0, 2, 3))
         shape2 = shape_i(img, 2, fgraph) - shape_i(kerns, 2, fgraph) + 1
         shape3 = shape_i(img, 3, fgraph) - shape_i(kerns, 3, fgraph) + 1
-        out = gpu_alloc_empty(shape_i(kerns, 1, fgraph),
-                        shape_i(img, 1, fgraph), shape2, shape3)
+        out = GpuAllocEmpty(img.dtype)(shape_i(kerns, 1, fgraph),
+                                       shape_i(img, 1, fgraph), shape2, shape3)
         desc = GpuDnnConvDesc(border_mode='valid', subsample=(1, 1),
                               conv_mode='cross')(img.shape, out.shape)
         conv = GpuDnnConvGradW()(img, kerns, out, desc)
-        return as_cuda_ndarray_variable(conv.dimshuffle(1, 0, 2, 3))
+        return as_gpuarray_variable(conv.dimshuffle(1, 0, 2, 3))
 
     elif (border_mode == 'full' and subsample == (1, 1) and
           direction_hint != 'forward!'):
@@ -699,8 +719,9 @@ def dnn_conv(img, kerns, border_mode='valid', subsample=(1, 1),
         conv_mode = 'cross' if conv_mode == 'conv' else 'conv'
         shape2 = shape_i(img, 2, fgraph) + shape_i(kerns, 2, fgraph) - 1
         shape3 = shape_i(img, 3, fgraph) + shape_i(kerns, 3, fgraph) - 1
-        out = gpu_alloc_empty(shape_i(img, 0, fgraph),
-                        shape_i(kerns, 1, fgraph), shape2, shape3)
+        out = GpuAllocEmpty(img.dtype)(shape_i(img, 0, fgraph),
+                                       shape_i(kerns, 1, fgraph),
+                                       shape2, shape3)
         desc = GpuDnnConvDesc(border_mode='valid', subsample=(1, 1),
                               conv_mode=conv_mode)(out.shape, kerns.shape)
         return GpuDnnConvGradI()(kerns, img, out, desc)
@@ -716,11 +737,11 @@ def dnn_conv(img, kerns, border_mode='valid', subsample=(1, 1),
     out_shp = GpuDnnConv.get_out_shape(img.shape, kerns.shape,
                                        desc_op.border_mode,
                                        desc_op.subsample)
-    out = gpu_alloc_empty(*out_shp)
+    out = GpuAllocEmpty(img.dtype)(*out_shp)
     return GpuDnnConv(workmem=workmem)(img, kerns, out, desc)
 
 
-class GpuDnnPoolDesc(GpuOp):
+class GpuDnnPoolDesc(Op):
     """
     This Op builds a pooling descriptor for use in the other
     pooling operations.
@@ -739,13 +760,13 @@ class GpuDnnPoolDesc(GpuOp):
         return ['cudnn.h', 'cudnn_helper.h']
 
     def c_header_dirs(self):
-        return [os.path.dirname(__file__)]
+        return [os.path.dirname(__file__), config.dnn.include_path]
 
     def c_libraries(self):
         return ['cudnn']
 
-    def c_compiler(self):
-        return NVCC_compiler
+    def c_lib_dirs(self):
+        return [config.dnn.library_path]
 
     def do_constant_folding(self, node):
         return False
@@ -841,7 +862,7 @@ class GpuDnnPool(DnnBase):
     __props__ = ()
 
     def make_node(self, img, desc):
-        img = as_cuda_ndarray_variable(img)
+        img = as_gpuarray_variable(img)
         if img.type.ndim != 4:
             raise TypeError('img must be 4D tensor')
 
@@ -860,8 +881,8 @@ class GpuDnnPool(DnnBase):
         return [(
             shape[0][0],
             shape[0][1],
-            (shape[0][2] + 2*padh - kh)//sh + 1,
-            (shape[0][3] + 2*padw - kw)//sw + 1
+            (shape[0][2] + 2 * padh - kh) // sh + 1,
+            (shape[0][3] + 2 * padw - kw) // sw + 1
         )]
 
     def c_support_code_struct(self, node, name):
@@ -906,9 +927,9 @@ if (output%(name)s != NULL) { cudnnDestroyTensorDescriptor(output%(name)s); }
         return """
 cudnnStatus_t err%(name)s;
 
-int %(out)s_dims[4];
+size_t %(out)s_dims[4];
 
-if (!CudaNdarray_is_c_contiguous(%(input)s)) {
+if (!GpuArray_IS_C_CONTIGUOUS(&%(input)s->ga)) {
   PyErr_SetString(PyExc_ValueError, "Only contiguous inputs are supported.");
   %(fail)s
 }
@@ -937,13 +958,13 @@ if (err%(name)s != CUDNN_STATUS_SUCCESS) {
   %(fail)s
 }
 
-%(out)s_dims[0] = CudaNdarray_HOST_DIMS(%(input)s)[0];
-%(out)s_dims[1] = CudaNdarray_HOST_DIMS(%(input)s)[1];
-%(out)s_dims[2] = (CudaNdarray_HOST_DIMS(%(input)s)[2] + (vpad*2) - wsX) / strideX + 1;
-%(out)s_dims[3] = (CudaNdarray_HOST_DIMS(%(input)s)[3] + (hpad*2) - wsY) / strideY + 1;
+%(out)s_dims[0] = PyGpuArray_DIMS(%(input)s)[0];
+%(out)s_dims[1] = PyGpuArray_DIMS(%(input)s)[1];
+%(out)s_dims[2] = (PyGpuArray_DIMS(%(input)s)[2] + (vpad*2) - wsX) / strideX + 1;
+%(out)s_dims[3] = (PyGpuArray_DIMS(%(input)s)[3] + (hpad*2) - wsY) / strideY + 1;
 
-if (CudaNdarray_prep_output(&%(out)s, 4, %(out)s_dims) != 0)
-{
+if (theano_prep_output(&%(out)s, 4, %(out)s_dims, %(input)s->ga.typecode,
+                       GA_C_ORDER, pygpu_default_context()) != 0) {
   %(fail)s
 }
 
@@ -952,8 +973,8 @@ if (CudaNdarray_prep_output(&%(out)s, 4, %(out)s_dims) != 0)
 err%(name)s = cudnnPoolingForward(
 _handle,
 %(desc)s,
-%(input_desc)s, CudaNdarray_DEV_DATA(%(input)s),
-%(output_desc)s, CudaNdarray_DEV_DATA(%(out)s)
+%(input_desc)s, PyGpuArray_DEV_DATA(%(input)s),
+%(output_desc)s, PyGpuArray_DEV_DATA(%(out)s)
 );
 #else
 {
@@ -963,9 +984,9 @@ err%(name)s = cudnnPoolingForward(
 _handle,
 %(desc)s,
 &alpha,
-%(input_desc)s, CudaNdarray_DEV_DATA(%(input)s),
+%(input_desc)s, PyGpuArray_DEV_DATA(%(input)s),
 &beta,
-%(output_desc)s, CudaNdarray_DEV_DATA(%(out)s)
+%(output_desc)s, PyGpuArray_DEV_DATA(%(out)s)
 );
 }
 #endif
@@ -978,8 +999,8 @@ if (err%(name)s != CUDNN_STATUS_SUCCESS) {
 """ % dict(out=out, desc=desc, fail=sub['fail'],
            name=name, set_in=set_in,
            set_out=set_out, input=inputs[0],
-           input_desc="input"+name,
-           output_desc="output"+name)
+           input_desc="input" + name,
+           output_desc="output" + name)
 
     def grad(self, inp, grads):
         img, desc = inp
@@ -998,7 +1019,7 @@ if (err%(name)s != CUDNN_STATUS_SUCCESS) {
         return [[1], [0]]
 
     def c_code_cache_version(self):
-        return (6, version())
+        return (7, version())
 
 
 class GpuDnnPoolGrad(DnnBase):
@@ -1013,15 +1034,15 @@ class GpuDnnPoolGrad(DnnBase):
     __props__ = ()
 
     def make_node(self, inp, out, inp_grad, desc):
-        inp = as_cuda_ndarray_variable(inp)
+        inp = as_gpuarray_variable(inp)
         if inp.type.ndim != 4:
             raise TypeError('inp must be 4D tensor')
 
-        inp_grad = as_cuda_ndarray_variable(inp_grad)
+        inp_grad = as_gpuarray_variable(inp_grad)
         if inp_grad.type.ndim != 4:
             raise TypeError('inp_grad must be 4D tensor')
 
-        out = as_cuda_ndarray_variable(out)
+        out = as_gpuarray_variable(out)
         if out.type.ndim != 4:
             raise TypeError('out must be 4D tensor')
 
@@ -1103,19 +1124,19 @@ if (output_grad%(name)s != NULL) { cudnnDestroyTensorDescriptor(output_grad%(nam
         return """
 cudnnStatus_t err%(name)s;
 
-if (!CudaNdarray_is_c_contiguous(%(input)s)) {
+if (!GpuArray_IS_C_CONTIGUOUS(&%(input)s->ga)) {
   PyErr_SetString(PyExc_ValueError,
                   "GpuDnnPoolGrad: Only contiguous inputs are supported.");
   %(fail)s
 }
 
-if (!CudaNdarray_is_c_contiguous(%(input_grad)s)) {
+if (!GpuArray_IS_C_CONTIGUOUS(&%(input_grad)s->ga)) {
   PyErr_SetString(PyExc_ValueError,
                   "GpuDnnPoolGrad: Only contiguous input gradients are supported.");
   %(fail)s
 }
 
-if (!CudaNdarray_is_c_contiguous(%(output)s)) {
+if (!GpuArray_IS_C_CONTIGUOUS(&%(output)s->ga)) {
   PyErr_SetString(PyExc_ValueError,
                   "GpuDnnPoolGrad: Only contiguous outputs are supported.");
   %(fail)s
@@ -1123,8 +1144,9 @@ if (!CudaNdarray_is_c_contiguous(%(output)s)) {
 
 %(set_in)s
 
-if (CudaNdarray_prep_output(&%(output_grad)s, 4,
-                            CudaNdarray_HOST_DIMS(%(output)s)) != 0)
+if (theano_prep_output(&%(output_grad)s, PyGpuArray_NDIM(%(output)s),
+                       PyGpuArray_DIMS(%(output)s), %(output)s->ga.typecode,
+                       GA_C_ORDER, pygpu_default_context()) != 0)
 {
   %(fail)s
 }
@@ -1134,10 +1156,10 @@ if (CudaNdarray_prep_output(&%(output_grad)s, 4,
 err%(name)s = cudnnPoolingBackward(
 _handle,
 %(desc)s,
-%(input_desc)s, CudaNdarray_DEV_DATA(%(input)s),
-%(input_grad_desc)s, CudaNdarray_DEV_DATA(%(input_grad)s),
-%(output_desc)s, CudaNdarray_DEV_DATA(%(output)s),
-%(output_grad_desc)s, CudaNdarray_DEV_DATA(%(output_grad)s)
+%(input_desc)s, PyGpuArray_DEV_DATA(%(input)s),
+%(input_grad_desc)s, PyGpuArray_DEV_DATA(%(input_grad)s),
+%(output_desc)s, PyGpuArray_DEV_DATA(%(output)s),
+%(output_grad_desc)s, PyGpuArray_DEV_DATA(%(output_grad)s)
 );
 #else
 {
@@ -1147,49 +1169,28 @@ err%(name)s = cudnnPoolingBackward(
 _handle,
 %(desc)s,
 &alpha,
-%(input_desc)s, CudaNdarray_DEV_DATA(%(input)s),
-%(input_grad_desc)s, CudaNdarray_DEV_DATA(%(input_grad)s),
-%(output_desc)s, CudaNdarray_DEV_DATA(%(output)s),
+%(input_desc)s, PyGpuArray_DEV_DATA(%(input)s),
+%(input_grad_desc)s, PyGpuArray_DEV_DATA(%(input_grad)s),
+%(output_desc)s, PyGpuArray_DEV_DATA(%(output)s),
 &beta,
-%(output_grad_desc)s, CudaNdarray_DEV_DATA(%(output_grad)s)
+%(output_grad_desc)s, PyGpuArray_DEV_DATA(%(output_grad)s)
 );
 }
 #endif
 if (err%(name)s != CUDNN_STATUS_SUCCESS) {
   PyErr_Format(PyExc_RuntimeError,
-               "GpuDnnPoolGrad: error doing operation: %%s. "
-               "input.shape=(%%d, %%d, %%d, %%d) "
-               "input_grad.shape=(%%d, %%d, %%d, %%d) "
-               "output.shape=(%%d, %%d, %%d, %%d) "
-               "output_grad.shape=(%%d, %%d, %%d, %%d)",
-               cudnnGetErrorString(err%(name)s),
-               CudaNdarray_HOST_DIMS(%(input)s)[0],
-               CudaNdarray_HOST_DIMS(%(input)s)[1],
-               CudaNdarray_HOST_DIMS(%(input)s)[2],
-               CudaNdarray_HOST_DIMS(%(input)s)[3],
-               CudaNdarray_HOST_DIMS(%(input_grad)s)[0],
-               CudaNdarray_HOST_DIMS(%(input_grad)s)[1],
-               CudaNdarray_HOST_DIMS(%(input_grad)s)[2],
-               CudaNdarray_HOST_DIMS(%(input_grad)s)[3],
-               CudaNdarray_HOST_DIMS(%(output)s)[0],
-               CudaNdarray_HOST_DIMS(%(output)s)[1],
-               CudaNdarray_HOST_DIMS(%(output)s)[2],
-               CudaNdarray_HOST_DIMS(%(output)s)[3],
-               CudaNdarray_HOST_DIMS(%(output_grad)s)[0],
-               CudaNdarray_HOST_DIMS(%(output_grad)s)[1],
-               CudaNdarray_HOST_DIMS(%(output_grad)s)[2],
-               CudaNdarray_HOST_DIMS(%(output_grad)s)[3]
-               );
+               "GpuDnnPoolGrad: error doing operation: %%s.",
+               cudnnGetErrorString(err%(name)s));
   %(fail)s
 }
 """ % dict(output_grad=out_grad, desc=desc,
            fail=sub['fail'],
            name=name, set_in=set_in,
            set_out=set_out, input=inp, input_grad=inp_grad, output=out,
-           input_desc="input"+name,
-           input_grad_desc="input_grad"+name,
-           output_desc="output"+name,
-           output_grad_desc="output_grad"+name)
+           input_desc="input" + name,
+           input_grad_desc="input_grad" + name,
+           output_desc="output" + name,
+           output_grad_desc="output_grad" + name)
 
     def c_code_cache_version(self):
         return (5, version())
@@ -1350,7 +1351,9 @@ if (%(mode)d == 1)
 
         # Build and prepare the output variable.
         result += """
-if (CudaNdarray_prep_output(&%(outs)s, 4, CudaNdarray_HOST_DIMS(%(ins)s)) != 0)
+if (theano_prep_output(&%(outs)s, PyGpuArray_NDIM(%(ins)s),
+                       PyGpuArray_DIMS(%(ins)s), %(ins)s->ga.typecode,
+                       GA_C_ORDER, pygpu_default_context()) != 0)
 {
   %(fail)s
 }
@@ -1365,7 +1368,7 @@ if (CudaNdarray_prep_output(&%(outs)s, 4, CudaNdarray_HOST_DIMS(%(ins)s)) != 0)
         return result
 
     def c_code_cache_version(self):
-        return (0, 6, version())
+        return (0, 7, version())
 
     def method(self):
         raise NotImplementedError('GpuDnnSoftmaxBase::method')
@@ -1386,7 +1389,7 @@ class GpuDnnSoftmax(GpuDnnSoftmaxBase):
     softmax_inputs = ['softmax_input']
 
     def make_node(self, x):
-        x = as_cuda_ndarray_variable(x)
+        x = as_gpuarray_variable(x)
         assert x.ndim == 4
         return Apply(self, [x], [x.type()])
 
@@ -1398,9 +1401,9 @@ err%(name)s = cudnnSoftmaxForward(
   algo%(name)s,
   mode%(name)s,
   softmax_input_%(name)s,
-  CudaNdarray_DEV_DATA(%(ins)s),
+  PyGpuArray_DEV_DATA(%(ins)s),
   softmax_output_%(name)s,
-  CudaNdarray_DEV_DATA(%(outs)s)
+  PyGpuArray_DEV_DATA(%(outs)s)
 );
 #else
 {
@@ -1412,10 +1415,10 @@ err%(name)s = cudnnSoftmaxForward(
   mode%(name)s,
   (void*) &alpha,
   softmax_input_%(name)s,
-  CudaNdarray_DEV_DATA(%(ins)s),
+  PyGpuArray_DEV_DATA(%(ins)s),
   (void*) &beta,
   softmax_output_%(name)s,
-  CudaNdarray_DEV_DATA(%(outs)s)
+  PyGpuArray_DEV_DATA(%(outs)s)
 );
 }
 #endif
@@ -1447,8 +1450,8 @@ class GpuDnnSoftmaxGrad(GpuDnnSoftmaxBase):
     softmax_inputs = ['softmax_gout', 'softmax_input']
 
     def make_node(self, dy, sm):
-        dy = as_cuda_ndarray_variable(dy)
-        sm = as_cuda_ndarray_variable(sm)
+        dy = as_gpuarray_variable(dy)
+        sm = as_gpuarray_variable(sm)
         assert dy.ndim == 4
         assert sm.ndim == 4
         return Apply(self, [dy, sm], [sm.type()])
@@ -1461,11 +1464,11 @@ err%(name)s = cudnnSoftmaxBackward(
   algo%(name)s,
   mode%(name)s,
   %(name1)s_%(name)s,
-  CudaNdarray_DEV_DATA(%(ins1)s),
+  PyGpuArray_DEV_DATA(%(ins1)s),
   %(name0)s_%(name)s,
-  CudaNdarray_DEV_DATA(%(ins0)s),
+  PyGpuArray_DEV_DATA(%(ins0)s),
   softmax_output_%(name)s,
-  CudaNdarray_DEV_DATA(%(outs)s)
+  PyGpuArray_DEV_DATA(%(outs)s)
 );
 #else
 {
@@ -1477,275 +1480,241 @@ err%(name)s = cudnnSoftmaxBackward(
   mode%(name)s,
   (void*) &alpha,
   %(name1)s_%(name)s,
-  CudaNdarray_DEV_DATA(%(ins1)s),
+  PyGpuArray_DEV_DATA(%(ins1)s),
   %(name0)s_%(name)s,
-  CudaNdarray_DEV_DATA(%(ins0)s),
+  PyGpuArray_DEV_DATA(%(ins0)s),
   (void*) &beta,
   softmax_output_%(name)s,
-  CudaNdarray_DEV_DATA(%(outs)s)
+  PyGpuArray_DEV_DATA(%(outs)s)
 );
 }
 #endif
         """
 
 
-# Intentation for history
-if True:
-    # @register_opt('cudnn')  # this optimizer is registered in opt.py instead.
-    @local_optimizer([GpuConv])
-    def local_conv_dnn(node):
+# @register_opt('cudnn')  # this optimizer is registered in opt.py instead.
+@local_optimizer([GpuConv])
+def local_conv_dnn(node):
+    if not dnn_available():
+        return
+    if isinstance(node.op, GpuConv):
+        if node.op.border_mode not in ['full', 'valid']:
+            return
+        img, kern = node.inputs
+        border_mode = node.op.border_mode
+        subsample = node.op.subsample
+        direction_hint = node.op.direction_hint
+        rval = dnn_conv(img, kern,
+                        border_mode=border_mode, subsample=subsample,
+                        direction_hint=direction_hint)
+        return [rval]
+
+
+# This optimizer is registered in opt.py as part of the meta-optimizer.
+# It tries exactly the opposite code path of what local_conv_dnn() uses,
+# because for some input/kernel shape configurations, this is faster.
+@local_optimizer([GpuConv])
+def local_conv_dnn_alternative(node):
+    if not dnn_available():
+        return
+    if isinstance(node.op, GpuConv):
+        border_mode = node.op.border_mode
+        subsample = node.op.subsample
+        if border_mode not in ['full', 'valid'] or subsample != (1, 1):
+            return
+        img, kern = node.inputs
+        direction_hint = node.op.direction_hint
+        if border_mode == 'full':
+            # for a full convolution, try using the forward pass instead
+            # of the backward pass wrt. inputs
+            direction_hint = 'forward!'
+        elif border_mode == 'valid':
+            # for a valid convolution, try using the backward pass wrt.
+            # weights instead of the forward pass and vice versa
+            if direction_hint == 'bprop weights':
+                direction_hint = 'forward'
+            else:
+                direction_hint = 'bprop weights'
+        rval = dnn_conv(img, kern,
+                        border_mode=border_mode, subsample=subsample,
+                        direction_hint=direction_hint)
+        if node.outputs[0].broadcastable != rval.broadcastable:
+            rval = tensor.patternbroadcast(
+                rval, node.outputs[0].type.broadcastable)
+        return [rval]
+
+
+conv_groupopt.register('local_conv_dnn', local_conv_dnn, 20,
+                       'conv_dnn', 'fast_compile', 'fast_run', 'cudnn')
+
+
+@local_optimizer([GpuDnnConv], inplace=True)
+def local_dnn_conv_inplace(node):
+    if type(node.op) != GpuDnnConv or node.op.inplace:
+        return
+    inputs = list(node.inputs)
+    dest = inputs[2]
+    if (dest.owner and
+            isinstance(dest.owner.op, GpuAllocEmpty) and
+            len(dest.clients) > 1):
+        inputs[2] = GpuAllocEmpty(dest.owner.op.dtype)(*dest.owner.inputs)
+    return [GpuDnnConv(workmem=node.op.workmem, inplace=True)(*inputs)]
+
+
+@local_optimizer([GpuDnnConvGradW], inplace=True)
+def local_dnn_convgw_inplace(node):
+    if type(node.op) != GpuDnnConvGradW or node.op.inplace:
+        return
+    inputs = list(node.inputs)
+    dest = inputs[2]
+    if (dest.owner and
+            isinstance(dest.owner.op, GpuAllocEmpty) and
+            len(dest.clients) > 1):
+        inputs[2] = GpuAllocEmpty(dest.owner.op.dtype)(*dest.owner.inputs)
+    return [GpuDnnConvGradW(inplace=True)(*inputs)]
+
+
+@local_optimizer([GpuDnnConvGradI], inplace=True)
+def local_dnn_convgi_inplace(node):
+    if type(node.op) != GpuDnnConvGradI or node.op.inplace:
+        return
+    inputs = list(node.inputs)
+    dest = inputs[2]
+    if (dest.owner and
+            isinstance(dest.owner.op, GpuAllocEmpty) and
+            len(dest.clients) > 1):
+        inputs[2] = GpuAllocEmpty(dest.owner.op.dtype)(*dest.owner.inputs)
+    return [GpuDnnConvGradI(inplace=True)(*inputs)]
+
+optdb.register('local_dnna_conv_inplace',
+               tensor.opt.in2out(local_dnn_conv_inplace,
+                                 local_dnn_convgw_inplace,
+                                 local_dnn_convgi_inplace,
+                                 name="local_dnn_conv_inplace"),
+               70.0, 'fast_run', 'inplace', 'gpuarray', 'cudnn')
+
+
+@register_opt('cudnn')
+@alpha_merge(GpuDnnConv, alpha_in=4, beta_in=5, nd=4)
+def local_dnn_conv_alpha_merge(node, *inputs):
+    if not dnn_available() or version() == -1:
+        return None
+    return [GpuDnnConv(workmem=node.op.workmem)(*inputs)]
+
+
+@register_opt('cudnn')
+@alpha_merge(GpuDnnConvGradW, alpha_in=4, beta_in=5, nd=4)
+def local_dnn_convw_alpha_merge(node, *inputs):
+    if not dnn_available() or version() == -1:
+        return None
+    return [GpuDnnConvGradW()(*inputs)]
+
+
+@register_opt('cudnn')
+@alpha_merge(GpuDnnConvGradI, alpha_in=4, beta_in=5, nd=4)
+def local_dnn_convi_alpha_merge(node, *inputs):
+    if not dnn_available() or version() == -1:
+        return None
+    return [GpuDnnConvGradI()(*inputs)]
+
+
+@register_opt('cudnn')
+@output_merge(GpuDnnConv, alpha_in=4, beta_in=5, out_in=2, nd=4)
+def local_dnn_conv_output_merge(node, *inputs):
+    inputs = inputs[0:2] + (gpu_contiguous(inputs[2]),) + inputs[3:]
+    return [GpuDnnConv(workmem=node.op.workmem)(*inputs)]
+
+
+@register_opt('cudnn')
+@output_merge(GpuDnnConvGradW, alpha_in=4, beta_in=5, out_in=2, nd=4)
+def local_dnn_convw_output_merge(node, *inputs):
+    inputs = inputs[0:2] + (gpu_contiguous(inputs[2]),) + inputs[3:]
+    return [GpuDnnConvGradW()(*inputs)]
+
+
+@register_opt('cudnn')
+@output_merge(GpuDnnConvGradI, alpha_in=4, beta_in=5, out_in=2, nd=4)
+def local_dnn_convi_output_merge(node, *inputs):
+    inputs = inputs[0:2] + (gpu_contiguous(inputs[2]),) + inputs[3:]
+    return [GpuDnnConvGradI()(*inputs)]
+
+
+@register_opt('cudnn')
+@op_lifter([DownsampleFactorMax])
+def local_pool_dnn_alternative(node):
+    if not dnn_available():
+        return
+    if not node.op.ignore_border:
+        return
+    img, = node.inputs
+    ds = node.op.ds
+    stride = node.op.st
+    pad = node.op.padding
+    mode = node.op.mode
+    return dnn_pool(gpu_contiguous(img.owner.inputs[0]),
+                    ds, stride=stride, pad=pad, mode=mode)
+
+
+@register_opt('cudnn')
+@op_lifter([DownsampleFactorMaxGrad])
+def local_pool_dnn_grad_stride(node):
+    if not dnn_available():
+        return
+    if not node.op.ignore_border:
+        return
+    inp, out, inp_grad = node.inputs
+    ds = node.op.ds
+    st = node.op.st
+    pad = node.op.padding
+    mode = node.op.mode
+
+    desc = GpuDnnPoolDesc(ws=ds, stride=st, mode=mode, pad=pad)()
+    return GpuDnnPoolGrad()(gpu_contiguous(inp),
+                            gpu_contiguous(out),
+                            gpu_contiguous(inp_grad),
+                            desc)
+
+
+@register_opt('cudnn')
+@local_optimizer([GpuSoftmax])
+def local_softmax_dnn(node):
+    if not dnn_available():
+        return
+    if isinstance(node.op, GpuSoftmax):
+        ins = node.inputs[0].dimshuffle(0, 1, 'x', 'x')
+        ins = gpu_contiguous(ins)
+        out = GpuDnnSoftmax('bc01', 'accurate', 'channel')(ins)
+        out = as_gpuarray_variable(out.dimshuffle(0, 1))
+        return [out]
+
+
+class NoCuDNNRaise(Optimizer):
+    def apply(self, fgraph):
+        """ Raise a RuntimeError if cudnn can't be used"""
         if not dnn_available():
+            # Make an assert error as we want Theano to fail, not
+            # just skip this optimization.
+            raise AssertionError(
+                "cuDNN optimization was enabled, but Theano was not able"
+                " to use it. We got this error: \n" +
+                dnn_available.msg)
+
+gpu_seqopt.register("NoCuDNNRaise", NoCuDNNRaise(), 0, 'cudnn')
+
+
+@register_opt('cudnn')
+@op_lifter([SoftmaxGrad])
+def local_softmax_dnn_grad(node):
+    if not dnn_available():
+        return
+    ins = []
+    for n in node.inputs:
+        if isinstance(n.owner.op, HostFromGpu):
+            n = n.owner.inputs[0]
+        if n.ndim != 2:
             return
-        if isinstance(node.op, GpuConv):
-            if node.op.border_mode not in ['full', 'valid']:
-                return
-            img, kern = node.inputs
-            border_mode = node.op.border_mode
-            subsample = node.op.subsample
-            direction_hint = node.op.direction_hint
-            rval = dnn_conv(img, kern,
-                            border_mode=border_mode, subsample=subsample,
-                            direction_hint=direction_hint)
-            if node.outputs[0].broadcastable != rval.broadcastable:
-                rval = tensor.patternbroadcast(
-                    rval, node.outputs[0].type.broadcastable)
-            return [rval]
+        ins.append(n.dimshuffle(0, 1, 'x', 'x'))
 
-    # This optimizer is registered in opt.py as part of the meta-optimizer.
-    # It tries exactly the opposite code path of what local_conv_dnn() uses,
-    # because for some input/kernel shape configurations, this is faster.
-    @local_optimizer([GpuConv])
-    def local_conv_dnn_alternative(node):
-        if not dnn_available():
-            return
-        if isinstance(node.op, GpuConv):
-            border_mode = node.op.border_mode
-            subsample = node.op.subsample
-            if border_mode not in ['full', 'valid'] or subsample != (1, 1):
-                return
-            img, kern = node.inputs
-            direction_hint = node.op.direction_hint
-            if border_mode == 'full':
-                # for a full convolution, try using the forward pass instead
-                # of the backward pass wrt. inputs
-                direction_hint = 'forward!'
-            elif border_mode == 'valid':
-                # for a valid convolution, try using the backward pass wrt.
-                # weights instead of the forward pass and vice versa
-                if direction_hint == 'bprop weights':
-                    direction_hint = 'forward'
-                else:
-                    direction_hint = 'bprop weights'
-            rval = dnn_conv(img, kern,
-                            border_mode=border_mode, subsample=subsample,
-                            direction_hint=direction_hint)
-            if node.outputs[0].broadcastable != rval.broadcastable:
-                rval = tensor.patternbroadcast(
-                    rval, node.outputs[0].type.broadcastable)
-            return [rval]
-
-    @local_optimizer([GpuDnnConv], inplace=True)
-    def local_dnn_conv_inplace(node):
-        if type(node.op) != GpuDnnConv or node.op.inplace:
-            return
-        inputs = list(node.inputs)
-        dest = inputs[2]
-        if (dest.owner and
-                isinstance(dest.owner.op, GpuAllocEmpty) and
-                len(dest.clients) > 1):
-            inputs[2] = gpu_alloc_empty(*dest.owner.inputs)
-        return [GpuDnnConv(workmem=node.op.workmem, inplace=True)(*inputs)]
-
-    @local_optimizer([GpuDnnConvGradW], inplace=True)
-    def local_dnn_convgw_inplace(node):
-        if type(node.op) != GpuDnnConvGradW or node.op.inplace:
-            return
-        inputs = list(node.inputs)
-        dest = inputs[2]
-        if (dest.owner and
-                isinstance(dest.owner.op, GpuAllocEmpty) and
-                len(dest.clients) > 1):
-            inputs[2] = gpu_alloc_empty(*dest.owner.inputs)
-        return [GpuDnnConvGradW(inplace=True)(*inputs)]
-
-    @local_optimizer([GpuDnnConvGradI], inplace=True)
-    def local_dnn_convgi_inplace(node):
-        if type(node.op) != GpuDnnConvGradI or node.op.inplace:
-            return
-        inputs = list(node.inputs)
-        dest = inputs[2]
-        if (dest.owner and
-                isinstance(dest.owner.op, GpuAllocEmpty) and
-                len(dest.clients) > 1):
-            inputs[2] = gpu_alloc_empty(*dest.owner.inputs)
-        return [GpuDnnConvGradI(inplace=True)(*inputs)]
-
-    optdb.register('local_dnn_conv_inplace',
-                   tensor.opt.in2out(local_dnn_conv_inplace,
-                                     local_dnn_convgw_inplace,
-                                     local_dnn_convgi_inplace,
-                                     name="local_dnn_conv_inplace"),
-                   70.0, 'fast_run', 'inplace', 'gpu', 'cudnn')
-
-    @register_opt('cudnn')
-    @alpha_merge(GpuDnnConv, alpha_in=4, beta_in=5, nd=4)
-    def local_dnn_conv_alpha_merge(node, *inputs):
-        if not dnn_available() or version() == -1:
-            return None
-        return [GpuDnnConv(workmem=node.op.workmem)(*inputs)]
-
-    @register_opt('cudnn')
-    @alpha_merge(GpuDnnConvGradW, alpha_in=4, beta_in=5, nd=4)
-    def local_dnn_convw_alpha_merge(node, *inputs):
-        if not dnn_available() or version() == -1:
-            return None
-        return [GpuDnnConvGradW()(*inputs)]
-
-    @register_opt('cudnn')
-    @alpha_merge(GpuDnnConvGradI, alpha_in=4, beta_in=5, nd=4)
-    def local_dnn_convi_alpha_merge(node, *inputs):
-        if not dnn_available() or version() == -1:
-            return None
-        return [GpuDnnConvGradI()(*inputs)]
-
-    @register_opt('cudnn')
-    @output_merge(GpuDnnConv, alpha_in=4, beta_in=5, out_in=2, nd=4)
-    def local_dnn_conv_output_merge(node, *inputs):
-        inputs = inputs[0:2] + (gpu_contiguous(inputs[2]),) + inputs[3:]
-        return [GpuDnnConv(workmem=node.op.workmem)(*inputs)]
-
-    @register_opt('cudnn')
-    @output_merge(GpuDnnConvGradW, alpha_in=4, beta_in=5, out_in=2, nd=4)
-    def local_dnn_convw_output_merge(node, *inputs):
-        inputs = inputs[0:2] + (gpu_contiguous(inputs[2]),) + inputs[3:]
-        return [GpuDnnConvGradW()(*inputs)]
-
-    @register_opt('cudnn')
-    @output_merge(GpuDnnConvGradI, alpha_in=4, beta_in=5, out_in=2, nd=4)
-    def local_dnn_convi_output_merge(node, *inputs):
-        inputs = inputs[0:2] + (gpu_contiguous(inputs[2]),) + inputs[3:]
-        return [GpuDnnConvGradI()(*inputs)]
-
-    @register_opt('cudnn')
-    @local_optimizer([GpuDownsampleFactorMax])
-    def local_pool_dnn(node):
-        if not dnn_available():
-            return
-        if isinstance(node.op, GpuDownsampleFactorMax):
-            if not node.op.ignore_border:
-                return
-            img, = node.inputs
-            ds = node.op.ds
-            return [dnn_pool(gpu_contiguous(img), ds, ds)]
-
-    @register_opt('cudnn')
-    @local_optimizer([DownsampleFactorMax])
-    def local_pool_dnn_alternative(node):
-        if not dnn_available():
-            return
-        if isinstance(node.op, DownsampleFactorMax):
-            if not node.op.ignore_border:
-                return
-            img, = node.inputs
-            ds = node.op.ds
-            stride = node.op.st
-            pad = node.op.padding
-            mode = node.op.mode
-            if (img.owner and isinstance(img.owner.op, HostFromGpu)):
-                ret = dnn_pool(gpu_contiguous(img.owner.inputs[0]),
-                               ds, stride=stride, pad=pad, mode=mode)
-                return [host_from_gpu(ret)]
-
-    @register_opt('cudnn')
-    @local_optimizer([GpuDownsampleFactorMaxGrad])
-    def local_pool_dnn_grad(node):
-        if not dnn_available():
-            return
-        if isinstance(node.op, GpuDownsampleFactorMaxGrad):
-            if not node.op.ignore_border:
-                return
-            inp, out, inp_grad = node.inputs
-            ds = node.op.ds
-
-            desc = GpuDnnPoolDesc(ws=ds, stride=ds, mode="max")()
-            return [GpuDnnPoolGrad()(gpu_contiguous(inp),
-                                     gpu_contiguous(out),
-                                     gpu_contiguous(inp_grad),
-                                     desc)]
-
-    @register_opt('cudnn')
-    @local_optimizer([DownsampleFactorMaxGrad])
-    def local_pool_dnn_grad_stride(node):
-        if not dnn_available():
-            return
-        if isinstance(node.op, DownsampleFactorMaxGrad):
-            if not node.op.ignore_border:
-                return
-            inp, out, inp_grad = node.inputs
-            ds = node.op.ds
-            st = node.op.st
-            pad = node.op.padding
-            mode = node.op.mode
-
-            if ((inp.owner and isinstance(inp.owner.op, HostFromGpu)) or
-                (out.owner and isinstance(out.owner.op, HostFromGpu)) or
-                (inp_grad.owner and isinstance(inp_grad.owner.op,
-                                               HostFromGpu))):
-                desc = GpuDnnPoolDesc(ws=ds, stride=st, mode=mode, pad=pad)()
-                ret = GpuDnnPoolGrad()(gpu_contiguous(inp),
-                                       gpu_contiguous(out),
-                                       gpu_contiguous(inp_grad),
-                                       desc)
-                return [host_from_gpu(ret)]
-
-    @register_opt('cudnn')
-    @local_optimizer([GpuSoftmax])
-    def local_softmax_dnn(node):
-        if not dnn_available():
-            return
-        if isinstance(node.op, GpuSoftmax):
-            ins = node.inputs[0].dimshuffle(0, 1, 'x', 'x')
-            ins = gpu_contiguous(ins)
-            out = GpuDnnSoftmax('bc01', 'accurate', 'channel')(ins)
-            out = as_cuda_ndarray_variable(out.dimshuffle(0, 1))
-            return [out]
-
-    class NoCuDNNRaise(Optimizer):
-        def apply(self, fgraph):
-            """ Raise a RuntimeError if cudnn can't be used"""
-            if not dnn_available():
-                # Make an assert error as we want Theano to fail, not
-                # just skip this optimization.
-                raise AssertionError(
-                    "cuDNN optimization was enabled, but Theano was not able"
-                    " to use it. We got this error: \n" +
-                    dnn_available.msg)
-    gpu_seqopt.register("NoCuDNNRaise", NoCuDNNRaise(), 0, 'cudnn')
-
-    @register_opt('cudnn')
-    @local_optimizer([SoftmaxGrad])
-    def local_softmax_dnn_grad(node):
-        if (isinstance(node.op, SoftmaxGrad) and
-            ((node.inputs[0].owner and
-              isinstance(node.inputs[0].owner.op, HostFromGpu))
-             or (node.inputs[1].owner and
-                 isinstance(node.inputs[1].owner.op, HostFromGpu)))):
-            if not dnn_available():
-                return
-            ins = []
-            for n in node.inputs:
-                if isinstance(n.owner.op, HostFromGpu):
-                    n = n.owner.inputs[0]
-                if n.ndim != 2:
-                    return
-                ins.append(n.dimshuffle(0, 1, 'x', 'x'))
-
-            out = GpuDnnSoftmaxGrad(
-                'bc01',
-                'accurate',
-                'channel'
-            )(
-                gpu_contiguous(ins[0]),
-                gpu_contiguous(ins[1])
-            )
-            return [out.dimshuffle(0, 1)]
+    out = GpuDnnSoftmaxGrad('bc01', 'accurate', 'channel')(
+        gpu_contiguous(ins[0]), gpu_contiguous(ins[1]))
+    return [out.dimshuffle(0, 1)]
