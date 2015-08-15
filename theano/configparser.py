@@ -116,6 +116,10 @@ def change_flags(**kwargs):
                          if v.fullname == k]
                     assert len(l) == 1
                     l[0].__set__(None, old_val[k])
+
+        # Make sure that the name of the decorated function remains the same.
+        inner.__name__ = f.__name__
+
         return inner
     return change_flags_exec
 
@@ -140,7 +144,7 @@ def fetch_val_for_key(key):
     # next try to find it in the config file
 
     # config file keys can be of form option, or section.option
-    key_tokens = key.split('.')
+    key_tokens = key.rsplit('.', 1)
     if len(key_tokens) > 2:
         raise KeyError(key)
 

@@ -292,6 +292,7 @@ class Subtensor(Op):
     check_input = False
     view_map = {0: [0]}
     _f16_ok = True
+    __props__ = ("idx_list",)
 
     @staticmethod
     def collapse(idxs, cond):
@@ -567,9 +568,6 @@ class Subtensor(Op):
 
         return rval
 
-    def __eq__(self, other):
-        return type(self) == type(other) and self.idx_list == other.idx_list
-
     def __hash__(self):
         # TODO: optimize by cache this hash value
         msg = []
@@ -813,10 +811,10 @@ class Subtensor(Op):
 
                 assert (slicelength <= length);
 
-                xview_offset += %(c_prefix)s_STRIDES(%(x)s)[outer_ii] * start *
-                       %(strides_mul)s;
+                xview_offset += (npy_intp)%(c_prefix)s_STRIDES(%(x)s)[outer_ii]
+                    * start * %(strides_mul)s;
                 xview_dims[inner_ii] = slicelength;
-                xview_strides[inner_ii] = %(c_prefix)s_STRIDES(%(x)s)[outer_ii] * step;
+                xview_strides[inner_ii] = (npy_intp)%(c_prefix)s_STRIDES(%(x)s)[outer_ii] * step;
 
                 inner_ii += 1;
                 spec_pos += 3;
@@ -829,7 +827,7 @@ class Subtensor(Op):
                 {
                     if (idx < %(c_prefix)s_DIMS(%(x)s)[outer_ii])
                     {
-                        xview_offset += %(c_prefix)s_STRIDES(%(x)s)[outer_ii] * idx *
+                        xview_offset += (npy_intp)%(c_prefix)s_STRIDES(%(x)s)[outer_ii] * idx *
                                %(strides_mul)s;
                     }
                     else
@@ -863,7 +861,7 @@ class Subtensor(Op):
 
     @staticmethod
     def helper_c_code_cache_version():
-        return (8,)
+        return (9,)
 
     def c_code(self, node, name, inputs, outputs, sub):  # DEBUG
         if not isinstance(node.inputs[0].type, theano.tensor.TensorType):
@@ -1009,6 +1007,8 @@ def inc_subtensor(x, y, inplace=False, set_instead_of_inc=False,
 
     :param x: the symbolic result of a Subtensor operation.
     :param y: the amount by which to increment ths subtensor in question
+    :param inplace: Don't use. Theano will do it when possible.
+    :param set_instead_of_inc: If True, do a set_subtensor instead.
     :param tolerate_inplace_aliasing: allow x and y to be views of a single
         underlying array even while working inplace.  For correct results,
         x and y must not be overlapping views; if they overlap, the result
@@ -1172,6 +1172,7 @@ class IncSubtensor(Op):
     """
 
     check_input = False
+    __props__ = ("idx_list", "inplace", "set_instead_of_inc")
 
     def __init__(self, idx_list, inplace=False, set_instead_of_inc=False,
                  destroyhandler_tolerate_aliased=None):
@@ -1184,12 +1185,6 @@ class IncSubtensor(Op):
         self.destroyhandler_tolerate_aliased = list(
             destroyhandler_tolerate_aliased)
         self.set_instead_of_inc = set_instead_of_inc
-
-    def __eq__(self, other):
-        return (type(self) == type(other) and
-                self.idx_list == other.idx_list and
-                self.inplace == other.inplace and
-                self.set_instead_of_inc == other.set_instead_of_inc)
 
     def __hash__(self):
         msg = []
@@ -2031,15 +2026,7 @@ class AdvancedSubtensor(Op):
     # Should be used by __getitem__ and __getslice__, as follow:
     # AdvancedSubtensor()(self, *args),
     # if args contains and advanced indexing pattern
-
-    def __eq__(self, other):
-        return self.__class__ == other.__class__
-
-    def __hash__(self):
-        return hash(self.__class__)
-
-    def __str__(self):
-        return self.__class__.__name__
+    __props__ = ()
 
     def make_node(self, x, *index):
         x = theano.tensor.as_tensor_variable(x)
@@ -2114,6 +2101,7 @@ class AdvancedIncSubtensor(Op):
         op.
 
     """
+    __props__ = ("inplace", "set_instead_of_inc")
 
     def __init__(self, inplace=False, set_instead_of_inc=False):
         self.inplace = inplace
@@ -2126,14 +2114,6 @@ class AdvancedIncSubtensor(Op):
                                       ' implemented')
 
         self.allow_legacy_perform = False
-
-    def __hash__(self):
-        return hash((type(self), self.inplace, self.set_instead_of_inc))
-
-    def __eq__(self, other):
-        return (type(self) == type(other) and
-                self.inplace == other.inplace and
-                self.set_instead_of_inc == other.set_instead_of_inc)
 
     def __str__(self):
         return "%s{%s, %s}" % (self.__class__.__name__,
